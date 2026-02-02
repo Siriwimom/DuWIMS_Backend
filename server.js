@@ -9,6 +9,26 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+const { connectMongo } = require("./mongo");
+
+(async () => {
+  try {
+    await connectMongo();
+  } catch (e) {
+    console.error("[MONGO] connect failed:", e.message);
+  }
+})();
+app.get("/mongo/ping", async (req, res) => {
+  try {
+    await connectMongo();
+    res.json({ ok: true, message: "MongoDB Atlas connected" });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+
+
 // ====== Health ======
 app.get("/health", (req, res) => res.json({ ok: true }));
 
