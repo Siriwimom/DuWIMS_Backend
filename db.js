@@ -16,17 +16,15 @@ const config = {
 };
 
 let pool;
-
 async function getPool() {
   if (pool) return pool;
 
-  // กันเงียบ ๆ ถ้า env ว่าง
   if (!config.user || !config.password) {
     throw new Error("Missing DB_USER/DB_PASSWORD in .env");
   }
 
   pool = await sql.connect(config);
-  console.log("[MSSQL] connected:", `${config.server}:${config.port}/${config.database} as ${config.user}`);
+  console.log("[MSSQL] connected:", `${config.server}:${config.port}/${config.database}`, "as", config.user);
   return pool;
 }
 
