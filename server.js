@@ -218,6 +218,7 @@ const Sensor = mongoose.models.Sensor || mongoose.model(
   "Sensor",
   new mongoose.Schema(
     {
+      // เก็บเป็น String เพื่อ backward compat กับของเดิม (FE ส่งมาเป็น string id)
       nodeId: { type: String, required: true, index: true },
       pinId: { type: String, default: null, index: true }, // optional
       sensorType: { type: String, required: true, index: true }, // soil_moisture, temp_rh, wind...
@@ -225,14 +226,20 @@ const Sensor = mongoose.models.Sensor || mongoose.model(
       unit: { type: String, default: "" },
       valueHint: { type: String, default: "" }, // optional
       status: { type: String, default: "OK" },
+
+      // ✅ ค่าอ่านล่าสุด (สำหรับหน้าเว็บโหลดเร็ว)
       lastReading: {
         value: { type: Number, default: null },
-        ts: { type: String, default: null },
+        ts: { type: String, default: null }, // ISO string
       },
     },
     { timestamps: true }
   )
 );
+
+// ✅ กัน sensor ซ้ำ: 1 node + 1 pin + 1 type + 1 name = 1 sensor
+Sensor.schema.index({ nodeId: 1, pinId: 1, sensorType: 1, name: 1 }, { unique: true });
+
 
 const Note = mongoose.models.Note || mongoose.model(
   "Note",
@@ -249,18 +256,28 @@ const Note = mongoose.models.Note || mongoose.model(
 );
 
 // History/Reading (ใช้กับหน้า History/summary/export)
+// History/Reading (ใช้กับหน้า History/summary/export)
+// ✅ เก็บ "ประวัติการวัด" ทุกครั้ง (สำหรับกราฟ/ย้อนหลัง)
 const Reading = mongoose.models.Reading || mongoose.model(
   "Reading",
   new mongoose.Schema(
     {
       sensorId: { type: String, required: true, index: true },
+      nodeId: { type: String, default: null, index: true },
+      pinId: { type: String, default: null, index: true },
+
       ts: { type: String, required: true, index: true }, // ISO string
       value: { type: Number, required: true },
+
+      status: { type: String, default: "OK" }, // optional
+      raw: { type: mongoose.Schema.Types.Mixed }, // optional payload ดิบ
     },
     { timestamps: true }
   )
 );
-Reading.schema.index({ sensorId: 1, ts: 1 });
+// ใช้ sort/ช่วงเวลา/กราฟเร็ว
+Reading.schema.index({ sensorId: 1, ts: -1 });
+
 
 // ----- helpers -----
 const toNum = (v) => (v === undefined || v === null || v === "" ? null : Number(v));
@@ -282,6 +299,113 @@ const leanWithId = (doc) => {
   d.id = String(d._id);
   return d;
 };
+
+// ==============================
+// Public Ingest (รับค่าจากตัวกลาง/อุปกรณ์) - ไม่บังคับ auth
+// แนะนำให้ตั้ง process.env.INGEST_KEY แล้วส่ง header: x-ingest-key
+// ==============================
+const ingestReadingHandler = async (req, res) => {
+  try {
+    const requiredKey = process.env.INGEST_KEY;
+    if (requiredKey) {
+      const got = String(req.headers["x-ingest-key"] || "");
+      if (got !== requiredKey) return res.status(401).json({ ok: false, message: "Invalid ingest key" });
+    }
+
+    const b = req.body || {};
+    const {
+      sensorId,
+      nodeId,
+      pinId,
+      sensorType,
+      name,
+      unit,
+      valueHint,
+      value,
+      ts,
+      status,
+      raw,
+    } = b;
+
+    const v = toNum(value);
+    if (v === null || Number.isNaN(v)) {
+      return res.status(400).json({ ok: false, message: "value must be number" });
+    }
+
+    const readingTs = ts || new Date().toISOString();
+    const readingStatus = status || "OK";
+
+    let sensorDoc = null;
+
+    // 1) resolve / upsert sensor
+    if (sensorId) {
+      if (!isValidObjectId(sensorId)) return res.status(400).json({ ok: false, message: "sensorId invalid" });
+      sensorDoc = await Sensor.findById(String(sensorId));
+      if (!sensorDoc) return res.status(404).json({ ok: false, message: "Sensor not found" });
+    } else {
+      if (!nodeId || !pinId || !sensorType || !name) {
+        return res.status(400).json({
+          ok: false,
+          message: "need nodeId, pinId, sensorType, name when sensorId not provided",
+        });
+      }
+
+      // upsert (กันซ้ำด้วย unique index)
+      sensorDoc = await Sensor.findOneAndUpdate(
+        { nodeId: String(nodeId), pinId: String(pinId), sensorType: String(sensorType), name: String(name) },
+        {
+          $setOnInsert: {
+            unit: unit || "",
+            valueHint: valueHint || "",
+            status: readingStatus,
+            lastReading: { value: v, ts: readingTs },
+          },
+        },
+        { new: true, upsert: true }
+      );
+
+      // ถ้าเป็น doc เดิม ให้ update lastReading ถ้าใหม่กว่า
+      if (sensorDoc && sensorDoc.lastReading && sensorDoc.lastReading.ts) {
+        const prevTs = new Date(sensorDoc.lastReading.ts).getTime();
+        const nextTs = new Date(readingTs).getTime();
+        if (!Number.isFinite(prevTs) || (Number.isFinite(nextTs) && nextTs >= prevTs)) {
+          await Sensor.updateOne(
+            { _id: sensorDoc._id },
+            { $set: { lastReading: { value: v, ts: readingTs }, status: readingStatus } }
+          );
+        }
+      }
+    }
+
+    // refresh sensor (ensure we have latest nodeId/pinId)
+    const sLean = await Sensor.findById(String(sensorDoc._id)).lean();
+
+    // 2) insert history
+    const item = await Reading.create({
+      sensorId: String(sensorDoc._id),
+      nodeId: sLean?.nodeId || String(nodeId || null),
+      pinId: sLean?.pinId || String(pinId || null),
+      ts: readingTs,
+      value: v,
+      status: readingStatus,
+      raw: raw || undefined,
+    });
+
+    return res.json({
+      ok: true,
+      sensorId: String(sensorDoc._id),
+      readingId: String(item._id),
+      lastReading: { value: v, ts: readingTs },
+      status: readingStatus,
+    });
+  } catch (e) {
+    // เผื่อชน unique index ตอน upsert พร้อมกัน
+    return res.status(500).json({ ok: false, message: String(e.message || e) });
+  }
+};
+
+app.post("/ingest/reading", ingestReadingHandler);
+app.post("/api/ingest/reading", ingestReadingHandler);
 
 const api = express.Router();
 api.use(auth);
@@ -1101,24 +1225,44 @@ api.delete("/notes/:noteId", async (req, res, next) => {
 // 8) readings/history (ของเดิม)
 // ==============================
 
-// POST /api/readings  { sensorId, ts?, value }
+// POST /api/readings  { sensorId, ts?, value, status?, raw? }
 api.post("/readings", async (req, res, next) => {
   try {
-    const { sensorId, ts, value } = req.body || {};
+    const { sensorId, ts, value, status, raw } = req.body || {};
     const s = await Sensor.findById(String(sensorId)).lean();
     if (!s) return res.status(404).json({ message: "Sensor not found" });
 
     const v = toNum(value);
     if (v === null || Number.isNaN(v)) return res.status(400).json({ message: "value must be number" });
 
-    const item = await Reading.create({ sensorId: String(sensorId), ts: ts || new Date().toISOString(), value: v });
+    const readingTs = ts || new Date().toISOString();
+    const readingStatus = status || "OK";
 
-    // update lastReading (quick)
-    await Sensor.findByIdAndUpdate(String(sensorId), { $set: { lastReading: { value: v, ts: item.ts } } });
+    // 1) INSERT history
+    const item = await Reading.create({
+      sensorId: String(sensorId),
+      nodeId: s.nodeId || null,
+      pinId: s.pinId || null,
+      ts: readingTs,
+      value: v,
+      status: readingStatus,
+      raw: raw || undefined,
+    });
+
+    // 2) UPDATE lastReading (เฉพาะถ้า ts ใหม่กว่าเดิม)
+    const prevTs = s?.lastReading?.ts ? new Date(s.lastReading.ts).getTime() : null;
+    const nextTs = new Date(readingTs).getTime();
+    if (!prevTs || (Number.isFinite(nextTs) && nextTs >= prevTs)) {
+      await Sensor.findByIdAndUpdate(String(sensorId), {
+        $set: { lastReading: { value: v, ts: readingTs }, status: readingStatus },
+      });
+    }
 
     res.status(201).json({ item: leanWithId(item) });
   } catch (e) { next(e); }
 });
+
+
 
 // GET /api/readings?plotId=&pinId=&sensorType=...&from=&to=
 api.get("/readings", async (req, res, next) => {
