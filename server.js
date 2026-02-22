@@ -6,6 +6,20 @@ const jwt = require("jsonwebtoken");
 const { sql, getPool } = require("./db");
 
 const app = express();
+
+const BUILD_TAG = "pins-autonumber-retry-v3"; // ✅ change this string when you update server.js
+
+console.log("========================================");
+console.log("[SERVER] BUILD:", BUILD_TAG);
+console.log("[SERVER] FILE :", __filename);
+console.log("[SERVER] CWD  :", process.cwd());
+console.log("========================================");
+
+// quick version endpoint
+app.get("/__version", (req, res) => {
+  res.json({ build: BUILD_TAG, file: __filename, cwd: process.cwd() });
+});
+
 app.use(cors());
 app.use(express.json());
 
@@ -258,6 +272,9 @@ const isValidLatLng = (lat, lng) =>
   lat >= -90 && lat <= 90 &&
   lng >= -180 && lng <= 180;
 
+
+// ✅ ObjectId guard (กัน CastError เวลา id ไม่ใช่ ObjectId)
+const isValidObjectId = (id) => mongoose.Types.ObjectId.isValid(String(id));
 const idOf = (doc) => (doc ? String(doc._id) : "");
 const leanWithId = (doc) => {
   if (!doc) return null;
@@ -650,32 +667,63 @@ api.get("/pins", async (req, res, next) => {
 // Add pin (requirement: POST /pins)
 api.post("/pins", async (req, res, next) => {
   try {
-    const { plotId, nodeId, number, lat, lng } = req.body || {};
+    const { plotId, nodeId, lat, lng } = req.body || {};
     if (!plotId) return res.status(400).json({ message: "plotId is required" });
-    if (!nodeId) return res.status(400).json({ message: "nodeId is required" });
 
-    const n = toNum(number);
     const la = toNum(lat);
     const lo = toNum(lng);
-
-    if (!n || la === null || lo === null) return res.status(400).json({ message: "number, lat, lng are required" });
+    if (la === null || lo === null) return res.status(400).json({ message: "lat, lng are required" });
     if (!isValidLatLng(la, lo)) return res.status(400).json({ message: "invalid lat/lng" });
 
     const plot = await Plot.findById(String(plotId)).lean();
     if (!plot) return res.status(404).json({ message: "Plot not found" });
 
-    const node = await NodeModel.findById(String(nodeId)).lean();
-    if (!node) return res.status(404).json({ message: "Node not found" });
-    if (String(node.plotId) !== String(plotId)) return res.status(400).json({ message: "nodeId does not belong to plotId" });
-
-    try {
-      const created = await Pin.create({ plotId: String(plotId), nodeId: String(nodeId), number: n, lat: la, lng: lo });
-      res.status(201).json({ item: leanWithId(created) });
-    } catch (e) {
-      const msg = String(e.message || e);
-      if (msg.includes("E11000")) return res.status(409).json({ message: "Pin number already exists in this plot" });
-      throw e;
+    // ✅ nodeId optional: ถ้าไม่ส่งมา -> ใช้/สร้าง Node ดินให้แปลงนี้
+    let nodeIdToUse = nodeId ? String(nodeId) : "";
+    if (!nodeIdToUse) {
+      const found = await NodeModel.findOne({ plotId: String(plotId), category: "soil" }).lean();
+      if (found) nodeIdToUse = String(found._id);
+      else {
+        const createdNode = await NodeModel.create({
+          plotId: String(plotId),
+          category: "soil",
+          name: "Node ดิน",
+          status: "ONLINE",
+        });
+        nodeIdToUse = String(createdNode._id);
+      }
     }
+
+    const node = await NodeModel.findById(String(nodeIdToUse)).lean();
+    if (!node) return res.status(404).json({ message: "Node not found" });
+    if (String(node.plotId) !== String(plotId))
+      return res.status(400).json({ message: "nodeId does not belong to plotId" });
+
+    // ✅ หาเลขว่างตัวแรกของ plot นี้แบบชัวร์ (กัน last เพี้ยน + กัน race)
+    let n = 1;
+    const last = await Pin.findOne({ plotId: String(plotId) }).sort({ number: -1 }).lean();
+    if (last && typeof last.number === "number") n = last.number + 1;
+
+    while (await Pin.exists({ plotId: String(plotId), number: n })) n += 1;
+
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      try {
+        const created = await Pin.create({
+          plotId: String(plotId),
+          nodeId: String(nodeIdToUse),
+          number: n,
+          lat: la,
+          lng: lo,
+        });
+        return res.status(201).json({ item: leanWithId(created) });
+      } catch (e) {
+        const msg = String(e?.message || e);
+        if (!msg.includes("E11000")) throw e;
+        n += 1;
+      }
+    }
+
+    return res.status(409).json({ message: "Pin number already exists in this plot" });
   } catch (e) { next(e); }
 });
 
@@ -746,11 +794,24 @@ api.post("/plots/:plotId/pins", async (req, res, next) => {
   }
 });
 
+// GET /api/pins/:pinId
+api.get("/pins/:pinId", async (req, res, next) => {
+  try {
+    const pinId = req.params.pinId;
+    if (!isValidObjectId(pinId)) return res.status(400).json({ message: "Invalid pinId" });
+    const pin = await Pin.findById(pinId).lean();
+    if (!pin) return res.status(404).json({ message: "Pin not found" });
+    res.json({ item: leanWithId(pin) });
+  } catch (e) { next(e); }
+});
+
 // PATCH /api/pins/:pinId
 api.patch("/pins/:pinId", async (req, res, next) => {
   try {
     const pinId = req.params.pinId;
-    const pin = await Pin.findById(pinId);
+    
+    if (!isValidObjectId(pinId)) return res.status(400).json({ message: "Invalid pinId" });
+const pin = await Pin.findById(pinId);
     if (!pin) return res.status(404).json({ message: "Pin not found" });
 
     const { number, lat, lng, nodeId } = req.body || {};
@@ -784,7 +845,9 @@ api.patch("/pins/:pinId", async (req, res, next) => {
 api.delete("/pins/:pinId", async (req, res, next) => {
   try {
     const pinId = req.params.pinId;
-    const pin = await Pin.findById(pinId).lean();
+    
+    if (!isValidObjectId(pinId)) return res.status(400).json({ message: "Invalid pinId" });
+const pin = await Pin.findById(pinId).lean();
     if (!pin) return res.status(404).json({ message: "Pin not found" });
 
     // ถ้า sensor ผูกกับ pinId -> ลบ sensor + reading ด้วย (ปลอดภัยไว้ก่อน)
@@ -918,6 +981,17 @@ api.post("/sensors", async (req, res, next) => {
     });
 
     res.status(201).json({ item: leanWithId(doc) });
+  } catch (e) { next(e); }
+});
+
+// GET /api/sensors/:sensorId
+api.get("/sensors/:sensorId", async (req, res, next) => {
+  try {
+    const sensorId = req.params.sensorId;
+    if (!isValidObjectId(sensorId)) return res.status(400).json({ message: "Invalid sensorId" });
+    const s = await Sensor.findById(sensorId).lean();
+    if (!s) return res.status(404).json({ message: "Sensor not found" });
+    res.json({ item: leanWithId(s) });
   } catch (e) { next(e); }
 });
 
