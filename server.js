@@ -7,7 +7,7 @@ const { sql, getPool } = require("./db");
 
 const app = express();
 
-const BUILD_TAG = "pins-autonumber-retry-v3"; // ✅ change this string when you update server.js
+const BUILD_TAG = "auth-nickname-v1"; // ✅ change this string when you update server.js
 
 console.log("========================================");
 console.log("[SERVER] BUILD:", BUILD_TAG);
@@ -41,8 +41,6 @@ app.get("/mongo/ping", async (req, res) => {
   }
 });
 
-
-
 // ====== Health ======
 app.get("/health", (req, res) => res.json({ ok: true }));
 
@@ -61,33 +59,36 @@ function auth(req, res, next) {
 }
 
 // ====== REGISTER ======
+// ✅ เพิ่ม nickname
 app.post("/auth/register", async (req, res) => {
-  const { email, password, role } = req.body;
+  const { email, password, nickname, role } = req.body;
 
-  if (!email || !password) {
-    return res.status(400).json({ message: "email/password required" });
+  if (!email || !password || !nickname) {
+    return res.status(400).json({ message: "email/password/nickname required" });
   }
 
   try {
     const password_hash = await bcrypt.hash(password, 10);
     const pool = await getPool();
 
-    await pool.request()
+    await pool
+      .request()
       .input("email", sql.NVarChar(255), email)
       .input("password_hash", sql.NVarChar(255), password_hash)
+      .input("nickname", sql.NVarChar(100), nickname)
       .input("role", sql.NVarChar(20), role === "owner" ? "owner" : "employee")
       .query(`
-        INSERT INTO users (email, password_hash, role)
-        VALUES (@email, @password_hash, @role)
+        INSERT INTO users (email, password_hash, nickname, role)
+        VALUES (@email, @password_hash, @nickname, @role)
       `);
 
     return res.json({ message: "registered" });
   } catch (e) {
     const msg = String(e.message || e);
 
-    // email ซ้ำ (unique constraint)
+    // email / nickname ซ้ำ (unique constraint)
     if (msg.toLowerCase().includes("unique") || msg.toLowerCase().includes("duplicate")) {
-      return res.status(409).json({ message: "email already exists" });
+      return res.status(409).json({ message: "email or nickname already exists" });
     }
 
     return res.status(500).json({ message: "server error", error: msg });
@@ -95,6 +96,7 @@ app.post("/auth/register", async (req, res) => {
 });
 
 // ====== LOGIN ======
+// ✅ ส่ง nickname กลับ + ใส่ใน token
 app.post("/auth/login", async (req, res) => {
   const { email, password } = req.body;
 
@@ -105,9 +107,14 @@ app.post("/auth/login", async (req, res) => {
   try {
     const pool = await getPool();
 
-    const r = await pool.request()
+    const r = await pool
+      .request()
       .input("email", sql.NVarChar(255), email)
-      .query(`SELECT TOP 1 id, email, password_hash, role FROM users WHERE email = @email`);
+      .query(`
+        SELECT TOP 1 id, email, password_hash, nickname, role
+        FROM users
+        WHERE email = @email
+      `);
 
     const user = r.recordset?.[0];
     if (!user) return res.status(401).json({ message: "invalid credentials" });
@@ -116,14 +123,14 @@ app.post("/auth/login", async (req, res) => {
     if (!ok) return res.status(401).json({ message: "invalid credentials" });
 
     const token = jwt.sign(
-      { id: user.id, email: user.email, role: user.role },
+      { id: user.id, email: user.email, nickname: user.nickname, role: user.role },
       process.env.JWT_SECRET,
       { expiresIn: "7d" }
     );
 
     return res.json({
       token,
-      user: { id: user.id, email: user.email, role: user.role },
+      user: { id: user.id, email: user.email, nickname: user.nickname, role: user.role },
     });
   } catch (e) {
     return res.status(500).json({ message: "server error", error: String(e.message || e) });
@@ -135,8 +142,6 @@ app.get("/me", auth, (req, res) => {
   res.json({ user: req.user });
 });
 
-
-
 // ==============================
 // DUWIMS /api (MongoDB persistent)
 // ตามเอกสาร DUWIMS_pages_data_requirements.docx
@@ -146,138 +151,148 @@ const mongoose = require("mongoose");
 
 // ----- Models (inline, single-file) -----
 // NOTE: ใช้ mongoose.models.* เพื่อกันประกาศซ้ำเวลา hot-reload / nodemon
-const Plot = mongoose.models.Plot || mongoose.model(
-  "Plot",
-  new mongoose.Schema(
-    {
-      // meta
-      alias: { type: String, default: "", trim: true },
-      plotName: { type: String, default: "", trim: true }, // ชื่อเต็ม
-      caretaker: { type: String, default: "", trim: true },
-      plantType: { type: String, default: "", trim: true },
-      plantedAt: { type: String, default: null }, // เก็บเป็น string (YYYY-MM-DD/ISO) เพื่อให้ FE ง่าย
-      status: { type: String, default: "ACTIVE" },
+const Plot =
+  mongoose.models.Plot ||
+  mongoose.model(
+    "Plot",
+    new mongoose.Schema(
+      {
+        // meta
+        alias: { type: String, default: "", trim: true },
+        plotName: { type: String, default: "", trim: true }, // ชื่อเต็ม
+        caretaker: { type: String, default: "", trim: true },
+        plantType: { type: String, default: "", trim: true },
+        plantedAt: { type: String, default: null }, // เก็บเป็น string (YYYY-MM-DD/ISO) เพื่อให้ FE ง่าย
+        status: { type: String, default: "ACTIVE" },
 
-      // backward compat (ของเดิมในไฟล์ server.js)
-      name: { type: String, default: "", trim: true },
-      cropType: { type: String, default: "", trim: true },
-      ownerName: { type: String, default: "", trim: true },
-    },
-    { timestamps: true }
-  )
-);
+        // backward compat (ของเดิมในไฟล์ server.js)
+        name: { type: String, default: "", trim: true },
+        cropType: { type: String, default: "", trim: true },
+        ownerName: { type: String, default: "", trim: true },
+      },
+      { timestamps: true }
+    )
+  );
 
-const NodeModel = mongoose.models.Node || mongoose.model(
-  "Node",
-  new mongoose.Schema(
-    {
-      plotId: { type: String, required: true, index: true },
-      category: { type: String, default: "soil", index: true }, // air | soil
-      name: { type: String, default: "", trim: true },
-      firmware: { type: String, default: "", trim: true },
-      lastSeen: { type: String, default: null },
-      status: { type: String, default: "ONLINE" },
-    },
-    { timestamps: true }
-  )
-);
+const NodeModel =
+  mongoose.models.Node ||
+  mongoose.model(
+    "Node",
+    new mongoose.Schema(
+      {
+        plotId: { type: String, required: true, index: true },
+        category: { type: String, default: "soil", index: true }, // air | soil
+        name: { type: String, default: "", trim: true },
+        firmware: { type: String, default: "", trim: true },
+        lastSeen: { type: String, default: null },
+        status: { type: String, default: "ONLINE" },
+      },
+      { timestamps: true }
+    )
+  );
 
-const Polygon = mongoose.models.Polygon || mongoose.model(
-  "Polygon",
-  new mongoose.Schema(
-    {
-      plotId: { type: String, required: true, index: true },
-      polygonId: { type: String, default: () => require("crypto").randomUUID() },
-      color: { type: String, default: "#2563eb" },
-      coords: { type: [[Number]], required: true }, // [[lat,lng],...]
-    },
-    { timestamps: true }
-  )
-);
+const Polygon =
+  mongoose.models.Polygon ||
+  mongoose.model(
+    "Polygon",
+    new mongoose.Schema(
+      {
+        plotId: { type: String, required: true, index: true },
+        polygonId: { type: String, default: () => require("crypto").randomUUID() },
+        color: { type: String, default: "#2563eb" },
+        coords: { type: [[Number]], required: true }, // [[lat,lng],...]
+      },
+      { timestamps: true }
+    )
+  );
 // ✅ รองรับหลาย polygons ต่อ 1 plot
 Polygon.schema.index({ plotId: 1, polygonId: 1 }, { unique: true });
 Polygon.schema.index({ plotId: 1 });
 
-const Pin = mongoose.models.Pin || mongoose.model(
-  "Pin",
-  new mongoose.Schema(
-    {
-      plotId: { type: String, required: true, index: true },
-      nodeId: { type: String, default: null, index: true }, // optional
-      sensorId: { type: String, default: null, index: true }, // optional (กรณี pin ผูกกับ sensor)
-      number: { type: Number, required: true },
-      lat: { type: Number, required: true },
-      lng: { type: Number, required: true },
-    },
-    { timestamps: true }
-  )
-);
+const Pin =
+  mongoose.models.Pin ||
+  mongoose.model(
+    "Pin",
+    new mongoose.Schema(
+      {
+        plotId: { type: String, required: true, index: true },
+        nodeId: { type: String, default: null, index: true }, // optional
+        sensorId: { type: String, default: null, index: true }, // optional (กรณี pin ผูกกับ sensor)
+        number: { type: Number, required: true },
+        lat: { type: Number, required: true },
+        lng: { type: Number, required: true },
+      },
+      { timestamps: true }
+    )
+  );
 Pin.schema.index({ plotId: 1, number: 1 }, { unique: true });
 
-const Sensor = mongoose.models.Sensor || mongoose.model(
-  "Sensor",
-  new mongoose.Schema(
-    {
-      // เก็บเป็น String เพื่อ backward compat กับของเดิม (FE ส่งมาเป็น string id)
-      nodeId: { type: String, required: true, index: true },
-      pinId: { type: String, default: null, index: true }, // optional
-      sensorType: { type: String, required: true, index: true }, // soil_moisture, temp_rh, wind...
-      name: { type: String, default: "", trim: true },
-      unit: { type: String, default: "" },
-      valueHint: { type: String, default: "" }, // optional
-      status: { type: String, default: "OK" },
+const Sensor =
+  mongoose.models.Sensor ||
+  mongoose.model(
+    "Sensor",
+    new mongoose.Schema(
+      {
+        // เก็บเป็น String เพื่อ backward compat กับของเดิม (FE ส่งมาเป็น string id)
+        nodeId: { type: String, required: true, index: true },
+        pinId: { type: String, default: null, index: true }, // optional
+        sensorType: { type: String, required: true, index: true }, // soil_moisture, temp_rh, wind...
+        name: { type: String, default: "", trim: true },
+        unit: { type: String, default: "" },
+        valueHint: { type: String, default: "" }, // optional
+        status: { type: String, default: "OK" },
 
-      // ✅ ค่าอ่านล่าสุด (สำหรับหน้าเว็บโหลดเร็ว)
-      lastReading: {
-        value: { type: Number, default: null },
-        ts: { type: String, default: null }, // ISO string
+        // ✅ ค่าอ่านล่าสุด (สำหรับหน้าเว็บโหลดเร็ว)
+        lastReading: {
+          value: { type: Number, default: null },
+          ts: { type: String, default: null }, // ISO string
+        },
       },
-    },
-    { timestamps: true }
-  )
-);
+      { timestamps: true }
+    )
+  );
 
 // ✅ กัน sensor ซ้ำ: 1 node + 1 pin + 1 type + 1 name = 1 sensor
 Sensor.schema.index({ nodeId: 1, pinId: 1, sensorType: 1, name: 1 }, { unique: true });
 
+const Note =
+  mongoose.models.Note ||
+  mongoose.model(
+    "Note",
+    new mongoose.Schema(
+      {
+        plotId: { type: String, required: true, index: true },
+        topic: { type: String, required: true, trim: true },
+        content: { type: String, default: "", trim: true },
+        author: { type: String, default: "" },
+        updatedBy: { type: String, default: "" },
+      },
+      { timestamps: true }
+    )
+  );
 
-const Note = mongoose.models.Note || mongoose.model(
-  "Note",
-  new mongoose.Schema(
-    {
-      plotId: { type: String, required: true, index: true },
-      topic: { type: String, required: true, trim: true },
-      content: { type: String, default: "", trim: true },
-      author: { type: String, default: "" },
-      updatedBy: { type: String, default: "" },
-    },
-    { timestamps: true }
-  )
-);
-
-// History/Reading (ใช้กับหน้า History/summary/export)
-// History/Reading (ใช้กับหน้า History/summary/export)
 // ✅ เก็บ "ประวัติการวัด" ทุกครั้ง (สำหรับกราฟ/ย้อนหลัง)
-const Reading = mongoose.models.Reading || mongoose.model(
-  "Reading",
-  new mongoose.Schema(
-    {
-      sensorId: { type: String, required: true, index: true },
-      nodeId: { type: String, default: null, index: true },
-      pinId: { type: String, default: null, index: true },
+const Reading =
+  mongoose.models.Reading ||
+  mongoose.model(
+    "Reading",
+    new mongoose.Schema(
+      {
+        sensorId: { type: String, required: true, index: true },
+        nodeId: { type: String, default: null, index: true },
+        pinId: { type: String, default: null, index: true },
 
-      ts: { type: String, required: true, index: true }, // ISO string
-      value: { type: Number, required: true },
+        ts: { type: String, required: true, index: true }, // ISO string
+        value: { type: Number, required: true },
 
-      status: { type: String, default: "OK" }, // optional
-      raw: { type: mongoose.Schema.Types.Mixed }, // optional payload ดิบ
-    },
-    { timestamps: true }
-  )
-);
+        status: { type: String, default: "OK" }, // optional
+        raw: { type: mongoose.Schema.Types.Mixed }, // optional payload ดิบ
+      },
+      { timestamps: true }
+    )
+  );
 // ใช้ sort/ช่วงเวลา/กราฟเร็ว
 Reading.schema.index({ sensorId: 1, ts: -1 });
-
 
 // ----- helpers -----
 const toNum = (v) => (v === undefined || v === null || v === "" ? null : Number(v));
@@ -285,10 +300,10 @@ const isValidLatLng = (lat, lng) =>
   typeof lat === "number" &&
   typeof lng === "number" &&
   !Number.isNaN(lat) &&
-  !Number.isNaN(lng) &&
-  lat >= -90 && lat <= 90 &&
-  lng >= -180 && lng <= 180;
-
+  lat >= -90 &&
+  lat <= 90 &&
+  lng >= -180 &&
+  lng <= 180;
 
 // ✅ ObjectId guard (กัน CastError เวลา id ไม่ใช่ ObjectId)
 const isValidObjectId = (id) => mongoose.Types.ObjectId.isValid(String(id));
@@ -313,19 +328,7 @@ const ingestReadingHandler = async (req, res) => {
     }
 
     const b = req.body || {};
-    const {
-      sensorId,
-      nodeId,
-      pinId,
-      sensorType,
-      name,
-      unit,
-      valueHint,
-      value,
-      ts,
-      status,
-      raw,
-    } = b;
+    const { sensorId, nodeId, pinId, sensorType, name, unit, valueHint, value, ts, status, raw } = b;
 
     const v = toNum(value);
     if (v === null || Number.isNaN(v)) {
@@ -411,7 +414,6 @@ const api = express.Router();
 api.use(auth);
 
 // ====== Enums (ให้ตรงทุกหน้า) ======
-// (อิงเอกสาร DUWIMS_pages_data_requirements.docx)
 const SENSOR_TYPES = [
   { key: "soil_moisture", label: "ความชื้นในดิน", unit: "%" },
   { key: "temp_rh", label: "อุณหภูมิ/ความชื้น", unit: "" },
@@ -434,7 +436,9 @@ api.get("/plots", async (req, res, next) => {
   try {
     const items = (await Plot.find().sort({ createdAt: -1 })).map(leanWithId);
     res.json({ items });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // POST /api/plots
@@ -460,7 +464,9 @@ api.post("/plots", async (req, res, next) => {
     });
 
     res.status(201).json({ item: leanWithId(doc) });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // GET /api/plots/:plotId
@@ -473,7 +479,9 @@ api.get("/plots/:plotId", async (req, res, next) => {
     const poly = await Polygon.findOne({ plotId: req.params.plotId }).lean();
 
     res.json({ item: { ...leanWithId(doc), polygon: poly || null } });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // PATCH /api/plots/:plotId
@@ -493,7 +501,9 @@ api.patch("/plots/:plotId", async (req, res, next) => {
     if (!doc) return res.status(404).json({ message: "Plot not found" });
 
     res.json({ item: leanWithId(doc) });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // DELETE /api/plots/:plotId (cascade)
@@ -515,7 +525,9 @@ api.delete("/plots/:plotId", async (req, res, next) => {
     await Plot.findByIdAndDelete(plotId);
 
     res.json({ ok: true });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // ==============================
@@ -530,7 +542,9 @@ api.get("/plots/:plotId/polygon", async (req, res, next) => {
 
     const item = await Polygon.findOne({ plotId }).lean();
     res.json({ item: item || null });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // PUT /api/plots/:plotId/polygon  { coords:[[lat,lng],...], color? }
@@ -558,9 +572,10 @@ api.put("/plots/:plotId/polygon", async (req, res, next) => {
     ).lean();
 
     res.json({ item });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
-
 
 // ===== polygons (multi) =====
 // GET /api/plots/:plotId/polygons  -> { items: [...] }
@@ -570,11 +585,12 @@ api.get("/plots/:plotId/polygons", async (req, res, next) => {
     const plot = await Plot.findById(plotId).lean();
     if (!plot) return res.status(404).json({ message: "Plot not found" });
 
-    const items = (await Polygon.find({ plotId }).sort({ createdAt: -1 }).lean())
-      .map((x) => ({ ...x, id: String(x._id) }));
+    const items = (await Polygon.find({ plotId }).sort({ createdAt: -1 }).lean()).map((x) => ({ ...x, id: String(x._id) }));
 
     res.json({ items });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // POST /api/plots/:plotId/polygons  (create new polygon)
@@ -605,7 +621,9 @@ api.post("/plots/:plotId/polygons", async (req, res, next) => {
     });
 
     res.status(201).json({ item: { ...doc.toObject(), id: String(doc._id) } });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // PATCH /api/plots/:plotId/polygons  (backward compatible upsert: polygonId default "poly-1")
@@ -636,7 +654,9 @@ api.patch("/plots/:plotId/polygons", async (req, res, next) => {
     );
 
     res.json({ item: { ...item.toObject(), id: String(item._id) } });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // PATCH /api/polygons/:id  (update one polygon by _id)
@@ -654,7 +674,9 @@ api.patch("/polygons/:id", async (req, res, next) => {
     if (!doc) return res.status(404).json({ message: "Polygon not found" });
 
     res.json({ item: { ...doc, id: String(doc._id) } });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // DELETE /api/polygons/:id  (delete one polygon by _id)
@@ -663,7 +685,9 @@ api.delete("/polygons/:id", async (req, res, next) => {
     const id = req.params.id;
     await Polygon.deleteOne({ _id: id });
     res.json({ ok: true });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // DELETE /api/plots/:plotId/polygons  (delete all)
@@ -672,7 +696,9 @@ api.delete("/plots/:plotId/polygons", async (req, res, next) => {
     const plotId = req.params.plotId;
     await Polygon.deleteMany({ plotId });
     res.json({ ok: true });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // ==============================
@@ -689,7 +715,9 @@ api.get("/nodes", async (req, res, next) => {
 
     const items = (await NodeModel.find(q).sort({ createdAt: -1 })).map(leanWithId);
     res.json({ items });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // POST /api/nodes
@@ -709,7 +737,9 @@ api.post("/nodes", async (req, res, next) => {
       status: b.status || "ONLINE",
     });
     res.status(201).json({ item: leanWithId(doc) });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // PATCH /api/nodes/:nodeId
@@ -723,7 +753,9 @@ api.patch("/nodes/:nodeId", async (req, res, next) => {
     const doc = await NodeModel.findByIdAndUpdate(req.params.nodeId, { $set: patch }, { new: true });
     if (!doc) return res.status(404).json({ message: "Node not found" });
     res.json({ item: leanWithId(doc) });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // DELETE /api/nodes/:nodeId (cascade sensors + readings)
@@ -735,7 +767,9 @@ api.delete("/nodes/:nodeId", async (req, res, next) => {
     await Sensor.deleteMany({ nodeId });
     await NodeModel.findByIdAndDelete(nodeId);
     res.json({ ok: true });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // ==============================
@@ -751,7 +785,9 @@ api.get("/plots/:plotId/pins", async (req, res, next) => {
 
     const items = (await Pin.find({ plotId }).sort({ number: 1 })).map(leanWithId);
     res.json({ items });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // GET /api/pins?plotId=&nodeCategory=&sensorType=
@@ -785,7 +821,9 @@ api.get("/pins", async (req, res, next) => {
     }
 
     res.json({ items: pins });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // Add pin (requirement: POST /pins)
@@ -820,8 +858,7 @@ api.post("/pins", async (req, res, next) => {
 
     const node = await NodeModel.findById(String(nodeIdToUse)).lean();
     if (!node) return res.status(404).json({ message: "Node not found" });
-    if (String(node.plotId) !== String(plotId))
-      return res.status(400).json({ message: "nodeId does not belong to plotId" });
+    if (String(node.plotId) !== String(plotId)) return res.status(400).json({ message: "nodeId does not belong to plotId" });
 
     // ✅ หาเลขว่างตัวแรกของ plot นี้แบบชัวร์ (กัน last เพี้ยน + กัน race)
     let n = 1;
@@ -848,9 +885,10 @@ api.post("/pins", async (req, res, next) => {
     }
 
     return res.status(409).json({ message: "Pin number already exists in this plot" });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
-
 
 // DELETE /api/pins?plotId=&nodeCategory=&sensorType=  (delete pins by scope - requirement)
 api.delete("/pins", async (req, res, next) => {
@@ -884,9 +922,10 @@ api.delete("/pins", async (req, res, next) => {
     await Pin.deleteMany({ _id: { $in: pinIds } });
 
     res.json({ ok: true, deletedPins: pinIds.length });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
-
 
 // POST /api/plots/:plotId/pins
 api.post("/plots/:plotId/pins", async (req, res, next) => {
@@ -926,16 +965,18 @@ api.get("/pins/:pinId", async (req, res, next) => {
     const pin = await Pin.findById(pinId).lean();
     if (!pin) return res.status(404).json({ message: "Pin not found" });
     res.json({ item: leanWithId(pin) });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // PATCH /api/pins/:pinId
 api.patch("/pins/:pinId", async (req, res, next) => {
   try {
     const pinId = req.params.pinId;
-    
+
     if (!isValidObjectId(pinId)) return res.status(400).json({ message: "Invalid pinId" });
-const pin = await Pin.findById(pinId);
+    const pin = await Pin.findById(pinId);
     if (!pin) return res.status(404).json({ message: "Pin not found" });
 
     const { number, lat, lng, nodeId } = req.body || {};
@@ -969,9 +1010,9 @@ const pin = await Pin.findById(pinId);
 api.delete("/pins/:pinId", async (req, res, next) => {
   try {
     const pinId = req.params.pinId;
-    
+
     if (!isValidObjectId(pinId)) return res.status(400).json({ message: "Invalid pinId" });
-const pin = await Pin.findById(pinId).lean();
+    const pin = await Pin.findById(pinId).lean();
     if (!pin) return res.status(404).json({ message: "Pin not found" });
 
     // ถ้า sensor ผูกกับ pinId -> ลบ sensor + reading ด้วย (ปลอดภัยไว้ก่อน)
@@ -982,7 +1023,9 @@ const pin = await Pin.findById(pinId).lean();
 
     await Pin.findByIdAndDelete(pinId);
     res.json({ ok: true });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // DELETE /api/plots/:plotId/pins  (ลบทั้งหมดใน plot)
@@ -1003,11 +1046,13 @@ api.delete("/plots/:plotId/pins", async (req, res, next) => {
     await Pin.deleteMany({ plotId });
 
     res.json({ ok: true });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // ==============================
-// 6) sensors (รองรับทั้งของเดิม /pins/:pinId/sensors และของเอกสาร /sensors?plotId=&nodeCategory=&sensorType=)
+// 6) sensors
 // ==============================
 
 // GET /api/pins/:pinId/sensors  (backward compat)
@@ -1017,10 +1062,11 @@ api.get("/pins/:pinId/sensors", async (req, res, next) => {
     const pin = await Pin.findById(pinId).lean();
     if (!pin) return res.status(404).json({ message: "Pin not found" });
 
-    // sensors ที่ผูก pinId ตรง
     const items = (await Sensor.find({ pinId }).sort({ createdAt: -1 })).map(leanWithId);
     res.json({ items });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // GET /api/sensors?plotId=&nodeCategory=&sensorType=
@@ -1042,7 +1088,9 @@ api.get("/sensors", async (req, res, next) => {
 
     const docs = await Sensor.find(q).sort({ createdAt: -1 });
     res.json({ items: docs.map(leanWithId) });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // POST /api/pins/:pinId/sensors (backward compat)  { typeKey|sensorType, name }
@@ -1079,7 +1127,9 @@ api.post("/pins/:pinId/sensors", async (req, res, next) => {
     });
 
     res.status(201).json({ item: leanWithId(doc) });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // POST /api/sensors  (ตามเอกสาร) { nodeId, sensorType, name, unit?, pinId? }
@@ -1105,7 +1155,9 @@ api.post("/sensors", async (req, res, next) => {
     });
 
     res.status(201).json({ item: leanWithId(doc) });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // GET /api/sensors/:sensorId
@@ -1116,7 +1168,9 @@ api.get("/sensors/:sensorId", async (req, res, next) => {
     const s = await Sensor.findById(sensorId).lean();
     if (!s) return res.status(404).json({ message: "Sensor not found" });
     res.json({ item: leanWithId(s) });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // PATCH /api/sensors/:sensorId
@@ -1141,7 +1195,9 @@ api.patch("/sensors/:sensorId", async (req, res, next) => {
 
     const doc = await Sensor.findByIdAndUpdate(sensorId, { $set: patch }, { new: true });
     res.json({ item: leanWithId(doc) });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // DELETE /api/sensors/:sensorId
@@ -1154,7 +1210,9 @@ api.delete("/sensors/:sensorId", async (req, res, next) => {
     await Reading.deleteMany({ sensorId });
     await Sensor.findByIdAndDelete(sensorId);
     res.json({ ok: true });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // ==============================
@@ -1170,7 +1228,9 @@ api.get("/plots/:plotId/notes", async (req, res, next) => {
 
     const items = (await Note.find({ plotId }).sort({ updatedAt: -1 })).map(leanWithId);
     res.json({ items });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // POST /api/plots/:plotId/notes
@@ -1192,7 +1252,9 @@ api.post("/plots/:plotId/notes", async (req, res, next) => {
     });
 
     res.status(201).json({ item: leanWithId(doc) });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // PATCH /api/notes/:noteId
@@ -1208,7 +1270,9 @@ api.patch("/notes/:noteId", async (req, res, next) => {
     const doc = await Note.findByIdAndUpdate(noteId, { $set: patch }, { new: true });
     if (!doc) return res.status(404).json({ message: "Note not found" });
     res.json({ item: leanWithId(doc) });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // DELETE /api/notes/:noteId
@@ -1218,7 +1282,9 @@ api.delete("/notes/:noteId", async (req, res, next) => {
     const doc = await Note.findByIdAndDelete(noteId).lean();
     if (!doc) return res.status(404).json({ message: "Note not found" });
     res.json({ ok: true });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // ==============================
@@ -1259,10 +1325,10 @@ api.post("/readings", async (req, res, next) => {
     }
 
     res.status(201).json({ item: leanWithId(item) });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
-
-
 
 // GET /api/readings?plotId=&pinId=&sensorType=...&from=&to=
 api.get("/readings", async (req, res, next) => {
@@ -1289,7 +1355,9 @@ api.get("/readings", async (req, res, next) => {
 
     const items = (await Reading.find(q).sort({ ts: 1 }).lean()).map((r) => ({ ...r, id: String(r._id) }));
     res.json({ items });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // GET /api/plots/:plotId/summary  (สรุป min/max/avg ล่าสุด)
@@ -1318,14 +1386,18 @@ api.get("/plots/:plotId/summary", async (req, res, next) => {
         sensorType: s.sensorType,
         name: s.name,
         unit: s.unit,
-        min, max, avg,
+        min,
+        max,
+        avg,
         last: last.value,
         lastAt: last.ts,
       });
     }
 
     res.json({ plotId, items });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // GET /api/export/readings.csv
@@ -1371,12 +1443,17 @@ api.get("/export/readings.csv", async (req, res, next) => {
         value: r.value,
         unit: s?.unit || "",
       };
-      const line = header.map((k) => String(row[k] ?? "").replaceAll('"', '""')).map((v) => `"${v}"`).join(",");
+      const line = header
+        .map((k) => String(row[k] ?? "").replaceAll('"', '""'))
+        .map((v) => `"${v}"`)
+        .join(",");
       res.write(line + "\n");
     }
 
     res.end();
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
 
 // 9) dashboard / weather (ของเดิม – ทำเป็น placeholder ได้)
@@ -1388,7 +1465,9 @@ api.get("/dashboard/overview", async (req, res) => {
 
 api.get("/dashboard/pins", async (req, res) => {
   const { plotId } = req.query;
-  const pins = plotId ? await Pin.find({ plotId: String(plotId) }).sort({ number: 1 }).lean() : await Pin.find().sort({ number: 1 }).lean();
+  const pins = plotId
+    ? await Pin.find({ plotId: String(plotId) }).sort({ number: 1 }).lean()
+    : await Pin.find().sort({ number: 1 }).lean();
   res.json({ items: pins.map((p) => ({ ...p, id: String(p._id) })) });
 });
 
