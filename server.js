@@ -582,16 +582,19 @@ api.post("/plots", async (req, res, next) => {
     const alias = b.alias || plotName || "";
     if (!plotName) return res.status(400).json({ message: "plotName (or name) is required" });
 
+    // ✅ ใช้ชื่อผู้ใช้จาก token เท่านั้น เพื่อกัน frontend ส่งค่าค้าง/ค่าผิด เช่น "0"
+    const nicknameFromToken = String(req.user?.nickname || "").trim();
+
     const doc = await Plot.create({
       alias,
       plotName,
-      caretaker: b.caretaker || b.ownerName || "",
+      caretaker: nicknameFromToken,
       plantType: b.plantType || b.cropType || "",
       plantedAt: b.plantedAt || null,
 
       // backward compat
       name: b.name || plotName,
-      ownerName: b.ownerName || b.caretaker || "",
+      ownerName: nicknameFromToken,
       cropType: b.cropType || b.plantType || "",
     });
 
