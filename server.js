@@ -3,11 +3,12 @@ const express = require("express");
 const cors = require("cors");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
+const { google } = require("googleapis");
 const { sql, getPool } = require("./db");
 
 const app = express();
 
-const BUILD_TAG = "auth-nickname-v1"; // ✅ change this string when you update server.js
+const BUILD_TAG = "auth-google-v3-login-redirect"; // ✅ change this string when you update server.js
 
 console.log("========================================");
 console.log("[SERVER] BUILD:", BUILD_TAG);
@@ -43,6 +44,22 @@ app.get("/mongo/ping", async (req, res) => {
 
 // ====== Health ======
 app.get("/health", (req, res) => res.json({ ok: true }));
+
+
+
+function makeSafeNickname(name, email) {
+  const base =
+    String(name || "").trim() ||
+    String(email || "").trim().split("@")[0] ||
+    "google_user";
+  return base.slice(0, 100);
+}
+
+const googleOAuth2Client = new google.auth.OAuth2(
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_CLIENT_SECRET,
+  process.env.GOOGLE_REDIRECT_URI
+);
 
 // ====== Auth middleware ======
 function auth(req, res, next) {
@@ -119,6 +136,10 @@ app.post("/auth/login", async (req, res) => {
     const user = r.recordset?.[0];
     if (!user) return res.status(401).json({ message: "invalid credentials" });
 
+    if (!user.password_hash) {
+      return res.status(401).json({ message: "invalid credentials" });
+    }
+
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) return res.status(401).json({ message: "invalid credentials" });
 
@@ -140,6 +161,117 @@ app.post("/auth/login", async (req, res) => {
 // ====== ME (ทดสอบ token) ======
 app.get("/me", auth, (req, res) => {
   res.json({ user: req.user });
+});
+
+// ====== GOOGLE LOGIN ======
+app.get("/auth/google/start", (req, res) => {
+  try {
+    if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET || !process.env.GOOGLE_REDIRECT_URI) {
+      return res.status(500).json({
+        message: "Google OAuth env is missing",
+        required: ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REDIRECT_URI"],
+      });
+    }
+
+    const url = googleOAuth2Client.generateAuthUrl({
+      access_type: "offline",
+      prompt: "consent",
+      scope: ["openid", "email", "profile"],
+    });
+
+    return res.redirect(url);
+  } catch (e) {
+    return res.status(500).json({ message: "google start failed", error: String(e.message || e) });
+  }
+});
+
+app.get("/auth/google/callback", async (req, res) => {
+  try {
+    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
+    const code = String(req.query.code || "");
+
+    if (!code) {
+      return res.redirect(`${frontendUrl}/login?error=${encodeURIComponent("Missing Google code")}`);
+    }
+
+    const { tokens } = await googleOAuth2Client.getToken(code);
+    googleOAuth2Client.setCredentials(tokens);
+
+    const oauth2 = google.oauth2({ auth: googleOAuth2Client, version: "v2" });
+    const { data } = await oauth2.userinfo.get();
+
+    const email = String(data.email || "").trim().toLowerCase();
+    const nickname = makeSafeNickname(data.name, email);
+
+    if (!email) {
+      return res.redirect(`${frontendUrl}/login?error=${encodeURIComponent("Google email not found")}`);
+    }
+
+    const pool = await getPool();
+
+    let userRes = await pool
+      .request()
+      .input("email", sql.NVarChar(255), email)
+      .query(`
+        SELECT TOP 1 id, email, password_hash, nickname, role
+        FROM users
+        WHERE email = @email
+      `);
+
+    let user = userRes.recordset?.[0];
+
+    if (!user) {
+      await pool
+        .request()
+        .input("email", sql.NVarChar(255), email)
+        .input("password_hash", sql.NVarChar(255), "")
+        .input("nickname", sql.NVarChar(100), nickname)
+        .input("role", sql.NVarChar(20), "employee")
+        .query(`
+          INSERT INTO users (email, password_hash, nickname, role)
+          VALUES (@email, @password_hash, @nickname, @role)
+        `);
+
+      userRes = await pool
+        .request()
+        .input("email", sql.NVarChar(255), email)
+        .query(`
+          SELECT TOP 1 id, email, password_hash, nickname, role
+          FROM users
+          WHERE email = @email
+        `);
+
+      user = userRes.recordset?.[0];
+    } else if (!String(user.nickname || "").trim() && nickname) {
+      await pool
+        .request()
+        .input("id", sql.Int, user.id)
+        .input("nickname", sql.NVarChar(100), nickname)
+        .query(`
+          UPDATE users
+          SET nickname = @nickname
+          WHERE id = @id
+        `);
+
+      user.nickname = nickname;
+    }
+
+    const token = jwt.sign(
+      {
+        id: user.id,
+        email: user.email,
+        nickname: user.nickname || nickname,
+        role: user.role || "employee",
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+
+    return res.redirect(`${frontendUrl}/login?token=${encodeURIComponent(token)}`);
+  } catch (e) {
+    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
+    return res.redirect(`${frontendUrl}/login?error=${encodeURIComponent(String(e.message || e))}`);
+  }
 });
 
 // ==============================
