@@ -5,7 +5,6 @@ const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const { google } = require("googleapis");
 const admin = require("firebase-admin");
-const { sql, getPool } = require("./db");
 
 if (!admin.apps.length) {
   admin.initializeApp({
@@ -27,11 +26,12 @@ const firestore = admin.firestore();
 const app = express();
 const api = express.Router();
 
-const BUILD_TAG = "firestore-pin-multi-node-v2";
+const BUILD_TAG = "firestore-100-auth-v1";
 const COLLECTIONS = {
   plots: "plots",
   nodes: "nodeTemplates",
   readings: "sensorReadings",
+  users: "users",
 };
 
 console.log("========================================");
@@ -138,13 +138,24 @@ function normalizeTopics(topics) {
 
 function normalizeCoords(coords) {
   if (!Array.isArray(coords)) return [];
+
   return coords
-    .map((pair) => {
-      if (!Array.isArray(pair) || pair.length < 2) return null;
-      const lat = Number(pair[0]);
-      const lng = Number(pair[1]);
-      if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
-      return [lat, lng];
+    .map((point) => {
+      if (Array.isArray(point) && point.length >= 2) {
+        const lat = Number(point[0]);
+        const lng = Number(point[1]);
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+        return { lat, lng };
+      }
+
+      if (point && typeof point === "object") {
+        const lat = Number(point.lat);
+        const lng = Number(point.lng);
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+        return { lat, lng };
+      }
+
+      return null;
     })
     .filter(Boolean);
 }
@@ -278,6 +289,7 @@ function normalizePinNode(node = {}, fallbackType = "air") {
 
   return {
     id: String(node.id || node._id || makeId("node")),
+    uid: String(node.uid || node.UID || "").trim(),
     templateId: node.templateId ? String(node.templateId) : null,
     nodeType: type,
     nodeName: String(node.nodeName || node.name || "").trim(),
@@ -347,7 +359,7 @@ function normalizePlotCreate(body = {}) {
 
 function normalizeNodeTemplateCreate(body = {}) {
   return {
-    nodeName: String(body.nodeName || "").trim(),
+    nodeName: String(body.nodeName || body.name || "").trim(),
     node_soil: normalizeNodeTemplatePart(body.node_soil || {}, "soil"),
     node_air: normalizeNodeTemplatePart(body.node_air || {}, "air"),
     status: String(body.status || "ACTIVE"),
@@ -358,182 +370,252 @@ function normalizeNodeTemplateCreate(body = {}) {
 
 function normalizeReadingCreate(body = {}) {
   return cleanUndefined({
-    plotId: String(body.plotId || ""),
-    pinId: String(body.pinId || ""),
-    nodeId: String(body.nodeId || ""),
-    nodeType: String(body.nodeType || ""),
-    sensorId: String(body.sensorId || ""),
-    sensorType: String(body.sensorType || ""),
+    plotId: String(body.plotId || "").trim(),
+    pinId: String(body.pinId || "").trim(),
+    nodeId: String(body.nodeId || "").trim(),
+    nodeUid: String(body.nodeUid || "").trim(),
+    nodeType: String(body.nodeType || "").trim(),
+    sensorId: String(body.sensorId || "").trim(),
+    sensorType: String(body.sensorType || "").trim(),
     ts: String(body.ts || nowIso()),
-    value: Number(body.value),
+    value: body.value,
     status: String(body.status || "OK"),
-    raw: body.raw,
+    raw: body.raw ?? null,
     createdAt: nowIso(),
     updatedAt: nowIso(),
   });
 }
 
-async function getCollectionItems(name, orderByField = "createdAt", direction = "desc") {
-  const snap = await firestore.collection(name).orderBy(orderByField, direction).get();
-  return snap.docs.map((d) => withId(d.id, d.data()));
+function normalizeUserCreate(body = {}) {
+  return cleanUndefined({
+    email: String(body.email || "").trim().toLowerCase(),
+    password_hash: String(body.password_hash || ""),
+    nickname: String(body.nickname || "").trim(),
+    role: body.role === "owner" ? "owner" : "employee",
+    provider: String(body.provider || "local"),
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+  });
+}
+
+async function getCollectionItems(name) {
+  const snap = await firestore.collection(name).get();
+  return snap.docs.map((doc) => withId(doc.id, doc.data()));
 }
 
 async function getPlotById(plotId) {
-  const snap = await firestore.collection(COLLECTIONS.plots).doc(String(plotId)).get();
-  if (!snap.exists) return null;
-  return withId(snap.id, snap.data());
+  const doc = await firestore.collection(COLLECTIONS.plots).doc(String(plotId)).get();
+  if (!doc.exists) return null;
+  return withId(doc.id, doc.data());
 }
 
 async function getNodeTemplateById(nodeId) {
-  const snap = await firestore.collection(COLLECTIONS.nodes).doc(String(nodeId)).get();
-  if (!snap.exists) return null;
-  return withId(snap.id, snap.data());
+  const doc = await firestore.collection(COLLECTIONS.nodes).doc(String(nodeId)).get();
+  if (!doc.exists) return null;
+  return withId(doc.id, doc.data());
 }
 
-async function findPlotByPinId(pinId) {
-  const plots = await firestore.collection(COLLECTIONS.plots).get();
-  for (const doc of plots.docs) {
-    const plot = withId(doc.id, doc.data());
-    const pin = plot?.polygon?.pins?.find((p) => String(p.id) === String(pinId));
-    if (pin) return { plot, pin };
-  }
-  return null;
+async function savePlot(plotId, data) {
+  await firestore.collection(COLLECTIONS.plots).doc(String(plotId)).set(cleanUndefined(data), {
+    merge: true,
+  });
 }
 
-function makePinNodeFromTemplatePart(part, type, templateId, fallbackName) {
-  if (!part) return null;
-  return normalizePinNode(
+async function saveNodeTemplate(nodeId, data) {
+  await firestore.collection(COLLECTIONS.nodes).doc(String(nodeId)).set(cleanUndefined(data), {
+    merge: true,
+  });
+}
+
+async function getUserByEmail(email) {
+  const safeEmail = String(email || "").trim().toLowerCase();
+  if (!safeEmail) return null;
+
+  const snap = await firestore
+    .collection(COLLECTIONS.users)
+    .where("email", "==", safeEmail)
+    .limit(1)
+    .get();
+
+  if (snap.empty) return null;
+  const doc = snap.docs[0];
+  return withId(doc.id, doc.data());
+}
+
+async function getUserByNickname(nickname) {
+  const safeNickname = String(nickname || "").trim();
+  if (!safeNickname) return null;
+
+  const snap = await firestore
+    .collection(COLLECTIONS.users)
+    .where("nickname", "==", safeNickname)
+    .limit(1)
+    .get();
+
+  if (snap.empty) return null;
+  const doc = snap.docs[0];
+  return withId(doc.id, doc.data());
+}
+
+async function createUser(data) {
+  const payload = normalizeUserCreate(data || {});
+  const ref = firestore.collection(COLLECTIONS.users).doc();
+  await ref.set(payload);
+  return withId(ref.id, payload);
+}
+
+function buildAuthToken(user) {
+  return jwt.sign(
     {
-      templateId,
-      nodeType: type,
-      nodeName: part.nodeName || fallbackName || "",
-      sensors: part.sensors || [],
+      id: user.id,
+      email: user.email,
+      nickname: user.nickname,
+      role: user.role,
+      provider: user.provider || "local",
     },
-    type
+    process.env.JWT_SECRET,
+    { expiresIn: "7d" }
   );
-}
-
-function applyTemplateToPin(pin, templateDoc) {
-  const next = normalizePin(pin);
-
-  if (!Array.isArray(next.node_air)) next.node_air = [];
-  if (!Array.isArray(next.node_soil)) next.node_soil = [];
-
-  const airNode = makePinNodeFromTemplatePart(
-    templateDoc?.node_air,
-    "air",
-    templateDoc?.id || templateDoc?._id || null,
-    templateDoc?.nodeName || "Node Air"
-  );
-  const soilNode = makePinNodeFromTemplatePart(
-    templateDoc?.node_soil,
-    "soil",
-    templateDoc?.id || templateDoc?._id || null,
-    templateDoc?.nodeName || "Node Soil"
-  );
-
-  if (airNode && airNode.sensors?.length) next.node_air.push(airNode);
-  if (soilNode && soilNode.sensors?.length) next.node_soil.push(soilNode);
-
-  next.updatedAt = nowIso();
-  return next;
-}
-
-function flattenSensorsFromPin(pin, plotId) {
-  const items = [];
-
-  for (const node of pin?.node_air || []) {
-    for (const s of node?.sensors || []) {
-      items.push({
-        ...s,
-        pinId: String(pin.id),
-        plotId: String(plotId),
-        nodeId: String(node.id),
-        nodeName: node.nodeName || "",
-        nodeType: "air",
-      });
-    }
-  }
-
-  for (const node of pin?.node_soil || []) {
-    for (const s of node?.sensors || []) {
-      items.push({
-        ...s,
-        pinId: String(pin.id),
-        plotId: String(plotId),
-        nodeId: String(node.id),
-        nodeName: node.nodeName || "",
-        nodeType: "soil",
-      });
-    }
-  }
-
-  return items;
 }
 
 function findNodeByIdInPin(pin, nodeId) {
-  const air = (pin?.node_air || []).find((n) => String(n.id) === String(nodeId));
+  const safeId = String(nodeId || "").trim();
+  if (!safeId) return null;
+
+  const air = (pin?.node_air || []).find((x) => String(x.id) === safeId);
   if (air) return { nodeType: "air", node: air };
 
-  const soil = (pin?.node_soil || []).find((n) => String(n.id) === String(nodeId));
+  const soil = (pin?.node_soil || []).find((x) => String(x.id) === safeId);
+  if (soil) return { nodeType: "soil", node: soil };
+
+  return null;
+}
+
+function findNodeByUidInPin(pin, uid) {
+  const safeUid = String(uid || "").trim();
+  if (!safeUid) return null;
+
+  const air = (pin?.node_air || []).find((x) => String(x.uid || "") === safeUid);
+  if (air) return { nodeType: "air", node: air };
+
+  const soil = (pin?.node_soil || []).find((x) => String(x.uid || "") === safeUid);
   if (soil) return { nodeType: "soil", node: soil };
 
   return null;
 }
 
 function findSensorByIdInPin(pin, sensorId) {
+  const safeId = String(sensorId || "").trim();
+  if (!safeId) return null;
+
   for (const node of pin?.node_air || []) {
-    const sensor = (node?.sensors || []).find((s) => String(s.id) === String(sensorId));
+    const sensor = (node.sensors || []).find((s) => String(s.id) === safeId);
     if (sensor) return { nodeType: "air", node, sensor };
   }
 
   for (const node of pin?.node_soil || []) {
-    const sensor = (node?.sensors || []).find((s) => String(s.id) === String(sensorId));
+    const sensor = (node.sensors || []).find((s) => String(s.id) === safeId);
     if (sensor) return { nodeType: "soil", node, sensor };
   }
 
   return null;
 }
 
-function findSensorByTypeInPin(pin, nodeType, sensorType) {
-  const list = nodeType === "air" ? pin?.node_air || [] : pin?.node_soil || [];
-  for (const node of list) {
-    const sensor = (node?.sensors || []).find(
-      (s) => String(s.sensorType) === String(sensorType)
-    );
-    if (sensor) return { node, sensor };
+async function findPlotAndPinByPinId(pinId) {
+  const safeId = String(pinId || "").trim();
+  if (!safeId) return { plot: null, pin: null };
+
+  const snap = await firestore.collection(COLLECTIONS.plots).get();
+  for (const doc of snap.docs) {
+    const plot = withId(doc.id, doc.data());
+    const pins = plot?.polygon?.pins || [];
+    const pin = pins.find((p) => String(p.id) === safeId);
+    if (pin) return { plot, pin };
   }
-  return null;
+  return { plot: null, pin: null };
 }
 
-async function saveNodeTemplate(nodeId, data) {
-  await firestore
-    .collection(COLLECTIONS.nodes)
-    .doc(String(nodeId))
-    .set(cleanUndefined(data), { merge: true });
+async function findPlotAndPinByNodeUid(nodeUid) {
+  const safeUid = String(nodeUid || "").trim();
+  if (!safeUid) return { plot: null, pin: null, node: null, nodeType: null };
+
+  const snap = await firestore.collection(COLLECTIONS.plots).get();
+  for (const doc of snap.docs) {
+    const plot = withId(doc.id, doc.data());
+    const pins = plot?.polygon?.pins || [];
+
+    for (const pin of pins) {
+      const match = findNodeByUidInPin(pin, safeUid);
+      if (match?.node) {
+        return {
+          plot,
+          pin,
+          node: match.node,
+          nodeType: match.nodeType,
+        };
+      }
+    }
+  }
+
+  return { plot: null, pin: null, node: null, nodeType: null };
 }
 
-async function savePlot(plotId, data) {
-  await firestore
-    .collection(COLLECTIONS.plots)
-    .doc(String(plotId))
-    .set(cleanUndefined(data), { merge: true });
-}
-
-async function createReadingAndUpdateNode({ pinId, sensorId, value, ts, status, raw }) {
+async function appendReadingAndUpdateLatest({ pinId, nodeUid, sensorId, sensorType, value, ts, status, raw }) {
   const safePinId = String(pinId || "").trim();
+  const safeNodeUid = String(nodeUid || "").trim();
   const safeSensorId = String(sensorId || "").trim();
-  if (!safePinId) throw new Error("Invalid pinId");
-  if (!safeSensorId) throw new Error("Invalid sensorId");
+  const safeSensorType = String(sensorType || "").trim();
 
-  const found = await findPlotByPinId(safePinId);
-  if (!found?.pin) {
-    const err = new Error("Pin not found");
-    err.statusCode = 404;
+  let found = null;
+
+  if (safePinId) {
+    const byPin = await findPlotAndPinByPinId(safePinId);
+    if (!byPin?.plot || !byPin?.pin) {
+      const err = new Error("Pin not found");
+      err.statusCode = 404;
+      throw err;
+    }
+    found = {
+      plot: byPin.plot,
+      pin: byPin.pin,
+    };
+  } else if (safeNodeUid) {
+    const byNodeUid = await findPlotAndPinByNodeUid(safeNodeUid);
+    if (!byNodeUid?.plot || !byNodeUid?.pin) {
+      const err = new Error("Node UID not found");
+      err.statusCode = 404;
+      throw err;
+    }
+    found = {
+      plot: byNodeUid.plot,
+      pin: byNodeUid.pin,
+    };
+  } else {
+    const err = new Error("pinId or nodeUid is required");
+    err.statusCode = 400;
     throw err;
   }
 
-  const match = findSensorByIdInPin(found.pin, safeSensorId);
+  let match = null;
+
+  if (safeSensorId) {
+    match = findSensorByIdInPin(found.pin, safeSensorId);
+  } else if (safeNodeUid && safeSensorType) {
+    const nodeMatch = findNodeByUidInPin(found.pin, safeNodeUid);
+    if (nodeMatch?.node) {
+      const sensor = (nodeMatch.node.sensors || []).find(
+        (s) => String(s.sensorType) === safeSensorType
+      );
+      if (sensor) {
+        match = {
+          nodeType: nodeMatch.nodeType,
+          node: nodeMatch.node,
+          sensor,
+        };
+      }
+    }
+  }
+
   if (!match?.sensor || !match?.node) {
     const err = new Error("Sensor not found");
     err.statusCode = 404;
@@ -549,10 +631,11 @@ async function createReadingAndUpdateNode({ pinId, sensorId, value, ts, status, 
 
   const reading = normalizeReadingCreate({
     plotId: found.plot.id,
-    pinId: safePinId,
+    pinId: found.pin.id,
     nodeId: match.node.id,
+    nodeUid: match.node.uid || "",
     nodeType: match.nodeType,
-    sensorId: safeSensorId,
+    sensorId: match.sensor.id,
     sensorType: match.sensor.sensorType,
     value: num,
     ts: ts || nowIso(),
@@ -565,7 +648,7 @@ async function createReadingAndUpdateNode({ pinId, sensorId, value, ts, status, 
 
   const plot = found.plot;
   const pins = [...(plot?.polygon?.pins || [])];
-  const pinIdx = pins.findIndex((p) => String(p.id) === safePinId);
+  const pinIdx = pins.findIndex((p) => String(p.id) === String(found.pin.id));
   if (pinIdx < 0) {
     const err = new Error("Pin not found");
     err.statusCode = 404;
@@ -581,7 +664,7 @@ async function createReadingAndUpdateNode({ pinId, sensorId, value, ts, status, 
         ...node,
         updatedAt: nowIso(),
         sensors: (node.sensors || []).map((s) => {
-          if (String(s.id) !== safeSensorId) return s;
+          if (String(s.id) !== String(match.sensor.id)) return s;
           return {
             ...s,
             value: num,
@@ -616,30 +699,39 @@ app.post("/auth/register", async (req, res) => {
   }
 
   try {
-    const password_hash = await bcrypt.hash(password, 10);
-    const pool = await getPool();
+    const safeEmail = String(email || "").trim().toLowerCase();
+    const safeNickname = String(nickname || "").trim();
 
-    await pool
-      .request()
-      .input("email", sql.NVarChar(255), email)
-      .input("password_hash", sql.NVarChar(255), password_hash)
-      .input("nickname", sql.NVarChar(100), nickname)
-      .input("role", sql.NVarChar(20), role === "owner" ? "owner" : "employee")
-      .query(`
-        INSERT INTO users (email, password_hash, nickname, role)
-        VALUES (@email, @password_hash, @nickname, @role)
-      `);
+    const [dupEmail, dupNickname] = await Promise.all([
+      getUserByEmail(safeEmail),
+      getUserByNickname(safeNickname),
+    ]);
 
-    return res.json({ message: "registered" });
-  } catch (e) {
-    const msg = String(e.message || e);
-    if (
-      msg.toLowerCase().includes("unique") ||
-      msg.toLowerCase().includes("duplicate")
-    ) {
+    if (dupEmail || dupNickname) {
       return res.status(409).json({ message: "email or nickname already exists" });
     }
-    return res.status(500).json({ message: "server error", error: msg });
+
+    const password_hash = await bcrypt.hash(String(password), 10);
+    const user = await createUser({
+      email: safeEmail,
+      password_hash,
+      nickname: safeNickname,
+      role,
+      provider: "local",
+    });
+
+    return res.status(201).json({
+      message: "registered",
+      user: {
+        id: user.id,
+        email: user.email,
+        nickname: user.nickname,
+        role: user.role,
+        provider: user.provider,
+      },
+    });
+  } catch (e) {
+    return res.status(500).json({ message: "server error", error: String(e.message || e) });
   }
 });
 
@@ -650,34 +742,17 @@ app.post("/auth/login", async (req, res) => {
   }
 
   try {
-    const pool = await getPool();
-    const r = await pool
-      .request()
-      .input("email", sql.NVarChar(255), email)
-      .query(`
-        SELECT TOP 1 id, email, password_hash, nickname, role
-        FROM users
-        WHERE email = @email
-      `);
+    const safeEmail = String(email || "").trim().toLowerCase();
+    const user = await getUserByEmail(safeEmail);
 
-    const user = r.recordset?.[0];
     if (!user || !user.password_hash) {
       return res.status(401).json({ message: "invalid credentials" });
     }
 
-    const ok = await bcrypt.compare(password, user.password_hash);
+    const ok = await bcrypt.compare(String(password), user.password_hash);
     if (!ok) return res.status(401).json({ message: "invalid credentials" });
 
-    const token = jwt.sign(
-      {
-        id: user.id,
-        email: user.email,
-        nickname: user.nickname,
-        role: user.role,
-      },
-      process.env.JWT_SECRET,
-      { expiresIn: "7d" }
-    );
+    const token = buildAuthToken(user);
 
     return res.json({
       token,
@@ -686,6 +761,7 @@ app.post("/auth/login", async (req, res) => {
         email: user.email,
         nickname: user.nickname,
         role: user.role,
+        provider: user.provider || "local",
       },
     });
   } catch (e) {
@@ -727,15 +803,6 @@ app.get("/auth/google/start", (req, res) => {
   }
 });
 
-app.get("/auth/google", (req, res) => {
-  const url = googleOAuth2Client.generateAuthUrl({
-    access_type: "offline",
-    prompt: "consent",
-    scope: ["openid", "email", "profile"],
-  });
-  res.json({ url });
-});
-
 app.get("/auth/google/callback", async (req, res) => {
   try {
     const code = req.query.code;
@@ -747,14 +814,30 @@ app.get("/auth/google/callback", async (req, res) => {
     const oauth2 = google.oauth2({ auth: googleOAuth2Client, version: "v2" });
     const me = await oauth2.userinfo.get();
 
-    const email = me.data.email;
-    const nickname = makeSafeNickname(me.data.name, email);
+    const email = String(me?.data?.email || "").trim().toLowerCase();
+    if (!email) {
+      return res.status(400).json({ message: "Google account has no email" });
+    }
 
-    const token = jwt.sign(
-      { email, nickname, role: "employee" },
-      process.env.JWT_SECRET,
-      { expiresIn: "7d" }
-    );
+    let user = await getUserByEmail(email);
+
+    if (!user) {
+      let nickname = makeSafeNickname(me?.data?.name, email);
+      const exists = await getUserByNickname(nickname);
+      if (exists) {
+        nickname = `${nickname}_${Date.now().toString().slice(-6)}`.slice(0, 100);
+      }
+
+      user = await createUser({
+        email,
+        password_hash: "",
+        nickname,
+        role: "employee",
+        provider: "google",
+      });
+    }
+
+    const token = buildAuthToken(user);
 
     const redirectBase = process.env.FRONTEND_URL || "http://localhost:3000";
 
@@ -771,12 +854,7 @@ app.get("/auth/google/callback", async (req, res) => {
   }
 });
 
-
 api.use(auth);
-
-/* =========================
-   NODE TEMPLATES
-========================= */
 
 api.get("/nodes", async (req, res, next) => {
   try {
@@ -865,10 +943,6 @@ api.delete("/nodes/:nodeId", async (req, res, next) => {
   }
 });
 
-/* =========================
-   PLOTS
-========================= */
-
 api.get("/plots", async (req, res, next) => {
   try {
     const items = await getCollectionItems(COLLECTIONS.plots);
@@ -905,21 +979,9 @@ api.get("/plots/:plotId/full", async (req, res, next) => {
   try {
     const plotId = requireId(res, req.params.plotId, "plotId");
     if (!plotId) return;
-
-    const plot = await getPlotById(plotId);
-    if (!plot) return res.status(404).json({ message: "Plot not found" });
-
-    const pins = (plot?.polygon?.pins || []).map((p, i) => normalizePin(p, i));
-
-    res.json({
-      item: {
-        ...plot,
-        polygon: {
-          ...(plot.polygon || { color: "#2563eb", coords: [], pins: [] }),
-          pins,
-        },
-      },
-    });
+    const item = await getPlotById(plotId);
+    if (!item) return res.status(404).json({ message: "Plot not found" });
+    res.json({ item });
   } catch (e) {
     next(e);
   }
@@ -934,23 +996,20 @@ api.patch("/plots/:plotId", async (req, res, next) => {
     if (!current) return res.status(404).json({ message: "Plot not found" });
 
     const b = req.body || {};
-    const update = { ...current, updatedAt: nowIso() };
+    const update = {
+      ...current,
+      updatedAt: nowIso(),
+    };
 
-    if (b.alias !== undefined) update.alias = b.alias;
-    if (b.plotName !== undefined) {
-      update.plotName = b.plotName;
-      update.name = b.plotName;
-    }
-    if (b.caretaker !== undefined) {
-      update.caretaker = b.caretaker;
-      update.ownerName = b.caretaker;
-    }
-    if (b.plantType !== undefined) {
-      update.plantType = b.plantType;
-      update.cropType = b.plantType;
-    }
-    if (b.plantedAt !== undefined) update.plantedAt = b.plantedAt;
-    if (b.status !== undefined) update.status = b.status;
+    if (b.alias !== undefined) update.alias = String(b.alias || "");
+    if (b.plotName !== undefined) update.plotName = String(b.plotName || "");
+    if (b.name !== undefined) update.name = String(b.name || "");
+    if (b.caretaker !== undefined) update.caretaker = String(b.caretaker || "");
+    if (b.ownerName !== undefined) update.ownerName = String(b.ownerName || "");
+    if (b.plantType !== undefined) update.plantType = String(b.plantType || "");
+    if (b.cropType !== undefined) update.cropType = String(b.cropType || "");
+    if (b.plantedAt !== undefined) update.plantedAt = String(b.plantedAt || "");
+    if (b.status !== undefined) update.status = String(b.status || "ACTIVE");
     if (b.topics !== undefined || b.topicAll !== undefined || b.Topic_all !== undefined) {
       update.topics = normalizeTopics(b.topics || b.topicAll || b.Topic_all || []);
     }
@@ -967,37 +1026,22 @@ api.delete("/plots/:plotId", async (req, res, next) => {
   try {
     const plotId = requireId(res, req.params.plotId, "plotId");
     if (!plotId) return;
-    const current = await getPlotById(plotId);
-    if (!current) return res.status(404).json({ message: "Plot not found" });
-
     await firestore.collection(COLLECTIONS.plots).doc(plotId).delete();
-
-    const readingSnap = await firestore
-      .collection(COLLECTIONS.readings)
-      .where("plotId", "==", plotId)
-      .get();
-
-    const batch = firestore.batch();
-    readingSnap.docs.forEach((d) => batch.delete(d.ref));
-    await batch.commit();
-
     res.json({ ok: true });
   } catch (e) {
     next(e);
   }
 });
 
-/* =========================
-   TOPICS
-========================= */
-
 api.get("/plots/:plotId/topics", async (req, res, next) => {
   try {
     const plotId = requireId(res, req.params.plotId, "plotId");
     if (!plotId) return;
+
     const plot = await getPlotById(plotId);
     if (!plot) return res.status(404).json({ message: "Plot not found" });
-    res.json({ items: plot.topics || [] });
+
+    res.json({ items: normalizeTopics(plot.topics || []) });
   } catch (e) {
     next(e);
   }
@@ -1007,32 +1051,29 @@ api.put("/plots/:plotId/topics", async (req, res, next) => {
   try {
     const plotId = requireId(res, req.params.plotId, "plotId");
     if (!plotId) return;
+
     const plot = await getPlotById(plotId);
     if (!plot) return res.status(404).json({ message: "Plot not found" });
 
-    plot.topics = normalizeTopics(
-      req.body?.topics || req.body?.topicAll || req.body?.Topic_all || []
-    );
+    plot.topics = normalizeTopics(req.body?.topics || req.body?.items || []);
     plot.updatedAt = nowIso();
 
     await savePlot(plotId, plot);
-    res.json({ items: plot.topics || [] });
+    res.json({ items: plot.topics });
   } catch (e) {
     next(e);
   }
 });
 
-/* =========================
-   POLYGON
-========================= */
-
 api.get("/plots/:plotId/polygon", async (req, res, next) => {
   try {
     const plotId = requireId(res, req.params.plotId, "plotId");
     if (!plotId) return;
+
     const plot = await getPlotById(plotId);
     if (!plot) return res.status(404).json({ message: "Plot not found" });
-    res.json({ item: plot.polygon || null });
+
+    res.json({ item: normalizePolygon(plot.polygon || {}) });
   } catch (e) {
     next(e);
   }
@@ -1046,32 +1087,15 @@ api.put("/plots/:plotId/polygon", async (req, res, next) => {
     const plot = await getPlotById(plotId);
     if (!plot) return res.status(404).json({ message: "Plot not found" });
 
-    const incoming = normalizePolygon(req.body || {});
-    const current = plot.polygon || {
-      id: makeId("polygon"),
-      color: "#2563eb",
-      coords: [],
-      pins: [],
-    };
-
-    plot.polygon = {
-      id: current.id || incoming.id,
-      color: incoming.color || current.color || "#2563eb",
-      coords: incoming.coords || [],
-      pins: Array.isArray(req.body?.pins) ? incoming.pins : current.pins || [],
-    };
+    plot.polygon = normalizePolygon(req.body || {});
     plot.updatedAt = nowIso();
 
     await savePlot(plotId, plot);
-    res.json({ item: plot.polygon || null });
+    res.json({ item: plot.polygon });
   } catch (e) {
     next(e);
   }
 });
-
-/* =========================
-   PINS
-========================= */
 
 api.get("/plots/:plotId/pins", async (req, res, next) => {
   try {
@@ -1081,8 +1105,7 @@ api.get("/plots/:plotId/pins", async (req, res, next) => {
     const plot = await getPlotById(plotId);
     if (!plot) return res.status(404).json({ message: "Plot not found" });
 
-    const items = (plot?.polygon?.pins || []).map((p, i) => normalizePin(p, i));
-    res.json({ items });
+    res.json({ items: (plot?.polygon?.pins || []).map(normalizePin) });
   } catch (e) {
     next(e);
   }
@@ -1096,19 +1119,11 @@ api.post("/plots/:plotId/pins", async (req, res, next) => {
     const plot = await getPlotById(plotId);
     if (!plot) return res.status(404).json({ message: "Plot not found" });
 
-    if (!plot.polygon) plot.polygon = normalizePolygon({});
+    const pins = [...(plot?.polygon?.pins || [])];
+    const pin = normalizePin(req.body || {}, pins.length);
+    pins.push(pin);
 
-    let pin = normalizePin(req.body || {}, (plot.polygon?.pins || []).length);
-
-    if (req.body?.nodeId) {
-      const templateDoc = await getNodeTemplateById(req.body.nodeId);
-      if (!templateDoc) {
-        return res.status(404).json({ message: "NodeTemplate not found" });
-      }
-      pin = applyTemplateToPin(pin, templateDoc);
-    }
-
-    plot.polygon.pins = [...(plot.polygon.pins || []), pin];
+    plot.polygon = normalizePolygon({ ...(plot.polygon || {}), pins });
     plot.updatedAt = nowIso();
 
     await savePlot(plotId, plot);
@@ -1123,13 +1138,10 @@ api.get("/pins/:pinId", async (req, res, next) => {
     const pinId = requireId(res, req.params.pinId, "pinId");
     if (!pinId) return;
 
-    const found = await findPlotByPinId(pinId);
-    if (!found?.pin) return res.status(404).json({ message: "Pin not found" });
+    const { plot, pin } = await findPlotAndPinByPinId(pinId);
+    if (!plot || !pin) return res.status(404).json({ message: "Pin not found" });
 
-    res.json({
-      item: normalizePin(found.pin),
-      plotId: String(found.plot.id),
-    });
+    res.json({ item: normalizePin(pin) });
   } catch (e) {
     next(e);
   }
@@ -1140,44 +1152,31 @@ api.patch("/pins/:pinId", async (req, res, next) => {
     const pinId = requireId(res, req.params.pinId, "pinId");
     if (!pinId) return;
 
-    const found = await findPlotByPinId(pinId);
-    if (!found?.pin) return res.status(404).json({ message: "Pin not found" });
+    const { plot, pin } = await findPlotAndPinByPinId(pinId);
+    if (!plot || !pin) return res.status(404).json({ message: "Pin not found" });
 
-    const plot = found.plot;
     const pins = [...(plot?.polygon?.pins || [])];
-    const idx = pins.findIndex((p) => String(p.id) === pinId);
+    const idx = pins.findIndex((p) => String(p.id) === String(pin.id));
     if (idx < 0) return res.status(404).json({ message: "Pin not found" });
 
-    let pin = normalizePin(pins[idx], idx);
+    const current = normalizePin(pins[idx], idx);
     const b = req.body || {};
 
-    if (b.number !== undefined) pin.number = Number(b.number);
-    if (b.pinName !== undefined) pin.pinName = String(b.pinName || "").trim();
-    if (b.lat !== undefined) pin.lat = Number(b.lat);
-    if (b.lng !== undefined) pin.lng = Number(b.lng);
+    if (b.number !== undefined) current.number = Number(b.number);
+    if (b.pinName !== undefined) current.pinName = String(b.pinName || "").trim();
+    if (b.name !== undefined) current.pinName = String(b.name || "").trim();
+    if (b.lat !== undefined) current.lat = Number(b.lat);
+    if (b.lng !== undefined) current.lng = Number(b.lng);
+    if (b.node_air !== undefined) current.node_air = normalizePinNodeArray(b.node_air, "air");
+    if (b.node_soil !== undefined) current.node_soil = normalizePinNodeArray(b.node_soil, "soil");
+    current.updatedAt = nowIso();
 
-    if (b.node_air !== undefined) {
-      pin.node_air = normalizePinNodeArray(b.node_air || [], "air");
-    }
-    if (b.node_soil !== undefined) {
-      pin.node_soil = normalizePinNodeArray(b.node_soil || [], "soil");
-    }
-
-    if (b.nodeId !== undefined && b.nodeId !== null && b.nodeId !== "") {
-      const templateDoc = await getNodeTemplateById(b.nodeId);
-      if (!templateDoc) {
-        return res.status(404).json({ message: "NodeTemplate not found" });
-      }
-      pin = applyTemplateToPin(pin, templateDoc);
-    }
-
-    pin.updatedAt = nowIso();
-    pins[idx] = pin;
+    pins[idx] = current;
     plot.polygon.pins = pins;
     plot.updatedAt = nowIso();
 
     await savePlot(plot.id, plot);
-    res.json({ item: pin });
+    res.json({ item: current });
   } catch (e) {
     next(e);
   }
@@ -1188,63 +1187,46 @@ api.delete("/pins/:pinId", async (req, res, next) => {
     const pinId = requireId(res, req.params.pinId, "pinId");
     if (!pinId) return;
 
-    const found = await findPlotByPinId(pinId);
-    if (!found?.pin) return res.status(404).json({ message: "Pin not found" });
+    const { plot, pin } = await findPlotAndPinByPinId(pinId);
+    if (!plot || !pin) return res.status(404).json({ message: "Pin not found" });
 
-    const plot = found.plot;
     plot.polygon.pins = (plot?.polygon?.pins || []).filter(
-      (p) => String(p.id) !== pinId
+      (p) => String(p.id) !== String(pin.id)
     );
     plot.updatedAt = nowIso();
 
     await savePlot(plot.id, plot);
-
-    const readingSnap = await firestore
-      .collection(COLLECTIONS.readings)
-      .where("pinId", "==", pinId)
-      .get();
-
-    const batch = firestore.batch();
-    readingSnap.docs.forEach((d) => batch.delete(d.ref));
-    await batch.commit();
-
     res.json({ ok: true });
   } catch (e) {
     next(e);
   }
 });
 
-/* =========================
-   PIN NODES
-========================= */
-
 api.patch("/pins/:pinId/node", async (req, res, next) => {
   try {
     const pinId = requireId(res, req.params.pinId, "pinId");
     if (!pinId) return;
 
-    const templateId = requireId(res, req.body?.nodeId, "nodeId");
-    if (!templateId) return;
+    const { plot, pin } = await findPlotAndPinByPinId(pinId);
+    if (!plot || !pin) return res.status(404).json({ message: "Pin not found" });
 
-    const templateDoc = await getNodeTemplateById(templateId);
-    if (!templateDoc) {
-      return res.status(404).json({ message: "NodeTemplate not found" });
-    }
+    const pins = [...(plot?.polygon?.pins || [])];
+    const idx = pins.findIndex((p) => String(p.id) === String(pin.id));
+    if (idx < 0) return res.status(404).json({ message: "Pin not found" });
 
-    const found = await findPlotByPinId(pinId);
-    if (!found?.pin) return res.status(404).json({ message: "Pin not found" });
+    const current = normalizePin(pins[idx], idx);
+    const b = req.body || {};
 
-    const plot = found.plot;
-    plot.polygon.pins = (plot?.polygon?.pins || []).map((p) => {
-      if (String(p.id) !== pinId) return p;
-      return applyTemplateToPin(p, templateDoc);
-    });
+    if (b.node_air !== undefined) current.node_air = normalizePinNodeArray(b.node_air, "air");
+    if (b.node_soil !== undefined) current.node_soil = normalizePinNodeArray(b.node_soil, "soil");
+    current.updatedAt = nowIso();
+
+    pins[idx] = current;
+    plot.polygon.pins = pins;
     plot.updatedAt = nowIso();
 
     await savePlot(plot.id, plot);
-
-    const pin = plot.polygon.pins.find((p) => String(p.id) === pinId) || null;
-    res.json({ item: pin });
+    res.json({ item: current });
   } catch (e) {
     next(e);
   }
@@ -1255,29 +1237,15 @@ api.get("/pins/:pinId/node", async (req, res, next) => {
     const pinId = requireId(res, req.params.pinId, "pinId");
     if (!pinId) return;
 
-    const found = await findPlotByPinId(pinId);
-    if (!found?.pin) return res.status(404).json({ message: "Pin not found" });
+    const { plot, pin } = await findPlotAndPinByPinId(pinId);
+    if (!plot || !pin) return res.status(404).json({ message: "Pin not found" });
 
     res.json({
       item: {
-        node_air: found.pin?.node_air || [],
-        node_soil: found.pin?.node_soil || [],
+        node_air: pin.node_air || [],
+        node_soil: pin.node_soil || [],
       },
     });
-  } catch (e) {
-    next(e);
-  }
-});
-
-api.get("/pins/:pinId/node-soil", async (req, res, next) => {
-  try {
-    const pinId = requireId(res, req.params.pinId, "pinId");
-    if (!pinId) return;
-
-    const found = await findPlotByPinId(pinId);
-    if (!found?.pin) return res.status(404).json({ message: "Pin not found" });
-
-    res.json({ item: found.pin?.node_soil || [] });
   } catch (e) {
     next(e);
   }
@@ -1288,10 +1256,24 @@ api.get("/pins/:pinId/node-air", async (req, res, next) => {
     const pinId = requireId(res, req.params.pinId, "pinId");
     if (!pinId) return;
 
-    const found = await findPlotByPinId(pinId);
-    if (!found?.pin) return res.status(404).json({ message: "Pin not found" });
+    const { plot, pin } = await findPlotAndPinByPinId(pinId);
+    if (!plot || !pin) return res.status(404).json({ message: "Pin not found" });
 
-    res.json({ item: found.pin?.node_air || [] });
+    res.json({ items: pin.node_air || [] });
+  } catch (e) {
+    next(e);
+  }
+});
+
+api.get("/pins/:pinId/node-soil", async (req, res, next) => {
+  try {
+    const pinId = requireId(res, req.params.pinId, "pinId");
+    if (!pinId) return;
+
+    const { plot, pin } = await findPlotAndPinByPinId(pinId);
+    if (!plot || !pin) return res.status(404).json({ message: "Pin not found" });
+
+    res.json({ items: pin.node_soil || [] });
   } catch (e) {
     next(e);
   }
@@ -1302,25 +1284,24 @@ api.post("/pins/:pinId/node-air", async (req, res, next) => {
     const pinId = requireId(res, req.params.pinId, "pinId");
     if (!pinId) return;
 
-    const found = await findPlotByPinId(pinId);
-    if (!found?.pin) return res.status(404).json({ message: "Pin not found" });
+    const { plot, pin } = await findPlotAndPinByPinId(pinId);
+    if (!plot || !pin) return res.status(404).json({ message: "Pin not found" });
 
-    const plot = found.plot;
     const pins = [...(plot?.polygon?.pins || [])];
-    const idx = pins.findIndex((p) => String(p.id) === pinId);
+    const idx = pins.findIndex((p) => String(p.id) === String(pin.id));
     if (idx < 0) return res.status(404).json({ message: "Pin not found" });
 
-    const pin = normalizePin(pins[idx], idx);
-    const node = normalizePinNode(req.body || {}, "air");
-    pin.node_air = [...(pin.node_air || []), node];
-    pin.updatedAt = nowIso();
+    const current = normalizePin(pins[idx], idx);
+    const item = normalizePinNode(req.body || {}, "air");
+    current.node_air = [...(current.node_air || []), item];
+    current.updatedAt = nowIso();
 
-    pins[idx] = pin;
+    pins[idx] = current;
     plot.polygon.pins = pins;
     plot.updatedAt = nowIso();
 
     await savePlot(plot.id, plot);
-    res.status(201).json({ item: node });
+    res.status(201).json({ item });
   } catch (e) {
     next(e);
   }
@@ -1331,25 +1312,24 @@ api.post("/pins/:pinId/node-soil", async (req, res, next) => {
     const pinId = requireId(res, req.params.pinId, "pinId");
     if (!pinId) return;
 
-    const found = await findPlotByPinId(pinId);
-    if (!found?.pin) return res.status(404).json({ message: "Pin not found" });
+    const { plot, pin } = await findPlotAndPinByPinId(pinId);
+    if (!plot || !pin) return res.status(404).json({ message: "Pin not found" });
 
-    const plot = found.plot;
     const pins = [...(plot?.polygon?.pins || [])];
-    const idx = pins.findIndex((p) => String(p.id) === pinId);
+    const idx = pins.findIndex((p) => String(p.id) === String(pin.id));
     if (idx < 0) return res.status(404).json({ message: "Pin not found" });
 
-    const pin = normalizePin(pins[idx], idx);
-    const node = normalizePinNode(req.body || {}, "soil");
-    pin.node_soil = [...(pin.node_soil || []), node];
-    pin.updatedAt = nowIso();
+    const current = normalizePin(pins[idx], idx);
+    const item = normalizePinNode(req.body || {}, "soil");
+    current.node_soil = [...(current.node_soil || []), item];
+    current.updatedAt = nowIso();
 
-    pins[idx] = pin;
+    pins[idx] = current;
     plot.polygon.pins = pins;
     plot.updatedAt = nowIso();
 
     await savePlot(plot.id, plot);
-    res.status(201).json({ item: node });
+    res.status(201).json({ item });
   } catch (e) {
     next(e);
   }
@@ -1361,50 +1341,46 @@ api.patch("/pins/:pinId/nodes/:nodeId", async (req, res, next) => {
     const nodeId = requireId(res, req.params.nodeId, "nodeId");
     if (!pinId || !nodeId) return;
 
-    const found = await findPlotByPinId(pinId);
-    if (!found?.pin) return res.status(404).json({ message: "Pin not found" });
+    const { plot, pin } = await findPlotAndPinByPinId(pinId);
+    if (!plot || !pin) return res.status(404).json({ message: "Pin not found" });
 
-    const plot = found.plot;
     const pins = [...(plot?.polygon?.pins || [])];
-    const pinIdx = pins.findIndex((p) => String(p.id) === pinId);
+    const pinIdx = pins.findIndex((p) => String(p.id) === String(pin.id));
     if (pinIdx < 0) return res.status(404).json({ message: "Pin not found" });
 
-    const pin = normalizePin(pins[pinIdx], pinIdx);
-    const match = findNodeByIdInPin(pin, nodeId);
-    if (!match?.node) return res.status(404).json({ message: "Node not found" });
+    const currentPin = normalizePin(pins[pinIdx], pinIdx);
+    const current = findNodeByIdInPin(currentPin, nodeId);
+    if (!current?.node) return res.status(404).json({ message: "Node not found" });
 
     const b = req.body || {};
-    const updateList = (list, type) =>
-      (list || []).map((n) => {
-        if (String(n.id) !== nodeId) return n;
-        return {
-          ...n,
-          nodeType: type,
-          nodeName:
-            b.nodeName !== undefined ? String(b.nodeName || "").trim() : n.nodeName,
-          sensors:
-            b.sensors !== undefined
-              ? (b.sensors || []).map(normalizeSensor)
-              : n.sensors || [],
-          updatedAt: nowIso(),
-        };
-      });
+    const patchNode = (node) => {
+      const updated = { ...node, updatedAt: nowIso() };
+      if (b.uid !== undefined) updated.uid = String(b.uid || "").trim();
+      if (b.templateId !== undefined) updated.templateId = b.templateId ? String(b.templateId) : null;
+      if (b.nodeName !== undefined) updated.nodeName = String(b.nodeName || "").trim();
+      if (b.name !== undefined) updated.nodeName = String(b.name || "").trim();
+      if (b.sensors !== undefined) updated.sensors = (b.sensors || []).map(normalizeSensor);
+      return updated;
+    };
 
-    if (match.nodeType === "air") {
-      pin.node_air = updateList(pin.node_air, "air");
+    if (current.nodeType === "air") {
+      currentPin.node_air = (currentPin.node_air || []).map((n) =>
+        String(n.id) === String(nodeId) ? patchNode(n) : n
+      );
     } else {
-      pin.node_soil = updateList(pin.node_soil, "soil");
+      currentPin.node_soil = (currentPin.node_soil || []).map((n) =>
+        String(n.id) === String(nodeId) ? patchNode(n) : n
+      );
     }
 
-    pin.updatedAt = nowIso();
-    pins[pinIdx] = pin;
+    currentPin.updatedAt = nowIso();
+    pins[pinIdx] = currentPin;
     plot.polygon.pins = pins;
     plot.updatedAt = nowIso();
 
     await savePlot(plot.id, plot);
-
-    const updatedNode = findNodeByIdInPin(pin, nodeId)?.node || null;
-    res.json({ item: updatedNode });
+    const updatedNode = findNodeByIdInPin(currentPin, nodeId);
+    res.json({ item: updatedNode?.node || null });
   } catch (e) {
     next(e);
   }
@@ -1416,59 +1392,45 @@ api.delete("/pins/:pinId/nodes/:nodeId", async (req, res, next) => {
     const nodeId = requireId(res, req.params.nodeId, "nodeId");
     if (!pinId || !nodeId) return;
 
-    const found = await findPlotByPinId(pinId);
-    if (!found?.pin) return res.status(404).json({ message: "Pin not found" });
+    const { plot, pin } = await findPlotAndPinByPinId(pinId);
+    if (!plot || !pin) return res.status(404).json({ message: "Pin not found" });
 
-    const plot = found.plot;
     const pins = [...(plot?.polygon?.pins || [])];
-    const pinIdx = pins.findIndex((p) => String(p.id) === pinId);
+    const pinIdx = pins.findIndex((p) => String(p.id) === String(pin.id));
     if (pinIdx < 0) return res.status(404).json({ message: "Pin not found" });
 
-    const pin = normalizePin(pins[pinIdx], pinIdx);
-    pin.node_air = (pin.node_air || []).filter((n) => String(n.id) !== nodeId);
-    pin.node_soil = (pin.node_soil || []).filter((n) => String(n.id) !== nodeId);
-    pin.updatedAt = nowIso();
+    const currentPin = normalizePin(pins[pinIdx], pinIdx);
+    currentPin.node_air = (currentPin.node_air || []).filter((n) => String(n.id) !== String(nodeId));
+    currentPin.node_soil = (currentPin.node_soil || []).filter((n) => String(n.id) !== String(nodeId));
+    currentPin.updatedAt = nowIso();
 
-    pins[pinIdx] = pin;
+    pins[pinIdx] = currentPin;
     plot.polygon.pins = pins;
     plot.updatedAt = nowIso();
 
     await savePlot(plot.id, plot);
-
-    const readingSnap = await firestore
-      .collection(COLLECTIONS.readings)
-      .where("pinId", "==", pinId)
-      .where("nodeId", "==", nodeId)
-      .get();
-
-    const batch = firestore.batch();
-    readingSnap.docs.forEach((d) => batch.delete(d.ref));
-    await batch.commit();
-
     res.json({ ok: true });
   } catch (e) {
     next(e);
   }
 });
 
-/* =========================
-   SENSORS
-========================= */
-
 api.get("/pins/:pinId/sensors", async (req, res, next) => {
   try {
     const pinId = requireId(res, req.params.pinId, "pinId");
     if (!pinId) return;
 
-    const found = await findPlotByPinId(pinId);
-    if (!found?.pin) return res.status(404).json({ message: "Pin not found" });
+    const { plot, pin } = await findPlotAndPinByPinId(pinId);
+    if (!plot || !pin) return res.status(404).json({ message: "Pin not found" });
 
-    const nodeType = String(req.query.nodeType || "all");
-    let items = flattenSensorsFromPin(found.pin, found.plot.id);
-
-    if (nodeType !== "all") {
-      items = items.filter((x) => String(x.nodeType) === nodeType);
-    }
+    const items = [
+      ...(pin.node_air || []).flatMap((node) =>
+        (node.sensors || []).map((sensor) => ({ ...sensor, nodeId: node.id, nodeUid: node.uid || "", nodeType: "air" }))
+      ),
+      ...(pin.node_soil || []).flatMap((node) =>
+        (node.sensors || []).map((sensor) => ({ ...sensor, nodeId: node.id, nodeUid: node.uid || "", nodeType: "soil" }))
+      ),
+    ];
 
     res.json({ items });
   } catch (e) {
@@ -1482,73 +1444,54 @@ api.patch("/sensors/:sensorId", async (req, res, next) => {
     if (!sensorId) return;
 
     const plots = await getCollectionItems(COLLECTIONS.plots);
-    let target = null;
-
     for (const plot of plots) {
-      for (const pin of plot?.polygon?.pins || []) {
-        const found = findSensorByIdInPin(pin, sensorId);
-        if (found?.sensor) {
-          target = {
-            plot,
-            pinId: pin.id,
-            nodeId: found.node.id,
-            nodeType: found.nodeType,
-          };
-          break;
-        }
-      }
-      if (target) break;
-    }
+      const pins = [...(plot?.polygon?.pins || [])];
+      let touched = false;
 
-    if (!target) return res.status(404).json({ message: "Sensor not found" });
+      const updatedPins = pins.map((pin, pinIndex) => {
+        const currentPin = normalizePin(pin, pinIndex);
 
-    const plot = target.plot;
-    const pins = [...(plot?.polygon?.pins || [])];
-    const pinIdx = pins.findIndex((p) => String(p.id) === String(target.pinId));
-    if (pinIdx < 0) return res.status(404).json({ message: "Pin not found" });
+        const patchNodeList = (list = []) =>
+          list.map((node) => ({
+            ...node,
+            sensors: (node.sensors || []).map((sensor) => {
+              if (String(sensor.id) !== String(sensorId)) return sensor;
+              touched = true;
+              const next = { ...sensor };
+              const b = req.body || {};
+              if (b.sensorType !== undefined) next.sensorType = String(b.sensorType || "").trim();
+              if (b.name !== undefined) next.name = String(b.name || "").trim();
+              if (b.unit !== undefined) next.unit = String(b.unit || "").trim();
+              if (b.value !== undefined) next.value = b.value;
+              if (b.valueHint !== undefined) next.valueHint = b.valueHint ?? "";
+              if (b.status !== undefined) next.status = String(b.status || "OK");
+              if (b.lastReadingAt !== undefined) next.lastReadingAt = b.lastReadingAt;
+              if (b.lastReading !== undefined) next.lastReading = b.lastReading;
+              return normalizeSensor(next);
+            }),
+          }));
 
-    const pin = normalizePin(pins[pinIdx], pinIdx);
-    const b = req.body || {};
-
-    const updateNodeList = (list = []) =>
-      list.map((node) => {
-        if (String(node.id) !== String(target.nodeId)) return node;
-        return {
-          ...node,
-          updatedAt: nowIso(),
-          sensors: (node.sensors || []).map((s) => {
-            if (String(s.id) !== String(sensorId)) return s;
-            return {
-              ...s,
-              ...(b.sensorType !== undefined ? { sensorType: b.sensorType } : {}),
-              ...(b.name !== undefined ? { name: b.name } : {}),
-              ...(b.unit !== undefined ? { unit: b.unit } : {}),
-              ...(b.value !== undefined ? { value: b.value } : {}),
-              ...(b.valueHint !== undefined ? { valueHint: b.valueHint } : {}),
-              ...(b.status !== undefined ? { status: b.status } : {}),
-              ...(b.lastReadingAt !== undefined ? { lastReadingAt: b.lastReadingAt } : {}),
-              ...(b.lastReading !== undefined ? { lastReading: b.lastReading } : {}),
-            };
-          }),
-        };
+        currentPin.node_air = patchNodeList(currentPin.node_air || []);
+        currentPin.node_soil = patchNodeList(currentPin.node_soil || []);
+        if (touched) currentPin.updatedAt = nowIso();
+        return currentPin;
       });
 
-    if (target.nodeType === "air") {
-      pin.node_air = updateNodeList(pin.node_air || []);
-    } else {
-      pin.node_soil = updateNodeList(pin.node_soil || []);
+      if (touched) {
+        plot.polygon.pins = updatedPins;
+        plot.updatedAt = nowIso();
+        await savePlot(plot.id, plot);
+
+        const fresh = await getPlotById(plot.id);
+        const pin = (fresh?.polygon?.pins || []).find((p) =>
+          findSensorByIdInPin(p, sensorId)?.sensor
+        );
+        const match = pin ? findSensorByIdInPin(pin, sensorId) : null;
+        return res.json({ item: match?.sensor || null });
+      }
     }
 
-    pin.updatedAt = nowIso();
-    pins[pinIdx] = pin;
-    plot.polygon.pins = pins;
-    plot.updatedAt = nowIso();
-
-    await savePlot(plot.id, plot);
-
-    const item =
-      flattenSensorsFromPin(pin, plot.id).find((s) => String(s.id) === sensorId) || null;
-    res.json({ item });
+    return res.status(404).json({ message: "Sensor not found" });
   } catch (e) {
     next(e);
   }
@@ -1556,32 +1499,35 @@ api.patch("/sensors/:sensorId", async (req, res, next) => {
 
 api.get("/sensors", async (req, res, next) => {
   try {
-    const { plotId, pinId, nodeType, sensorType, nodeId } = req.query || {};
-
-    let plots = [];
-    if (plotId) {
-      const plot = await getPlotById(String(plotId));
-      plots = plot ? [plot] : [];
-    } else {
-      plots = await getCollectionItems(COLLECTIONS.plots);
-    }
-
     const items = [];
+    const plots = await getCollectionItems(COLLECTIONS.plots);
+
     for (const plot of plots) {
       for (const pin of plot?.polygon?.pins || []) {
-        if (pinId && String(pin.id) !== String(pinId)) continue;
-
-        let sensors = flattenSensorsFromPin(pin, plot.id);
-
-        if (nodeId) sensors = sensors.filter((x) => String(x.nodeId) === String(nodeId));
-        if (nodeType && nodeType !== "all") {
-          sensors = sensors.filter((x) => String(x.nodeType) === String(nodeType));
+        for (const node of pin.node_air || []) {
+          for (const sensor of node.sensors || []) {
+            items.push({
+              ...sensor,
+              plotId: plot.id,
+              pinId: pin.id,
+              nodeId: node.id,
+              nodeUid: node.uid || "",
+              nodeType: "air",
+            });
+          }
         }
-        if (sensorType && sensorType !== "all") {
-          sensors = sensors.filter((x) => String(x.sensorType) === String(sensorType));
+        for (const node of pin.node_soil || []) {
+          for (const sensor of node.sensors || []) {
+            items.push({
+              ...sensor,
+              plotId: plot.id,
+              pinId: pin.id,
+              nodeId: node.id,
+              nodeUid: node.uid || "",
+              nodeType: "soil",
+            });
+          }
         }
-
-        items.push(...sensors);
       }
     }
 
@@ -1591,80 +1537,27 @@ api.get("/sensors", async (req, res, next) => {
   }
 });
 
-/* =========================
-   READINGS
-========================= */
-
 api.post("/readings", async (req, res, next) => {
   try {
-    const item = await createReadingAndUpdateNode(req.body || {});
+    const item = await appendReadingAndUpdateLatest(req.body || {});
     res.status(201).json({ item });
   } catch (e) {
-    if (e.statusCode) return res.status(e.statusCode).json({ message: e.message });
     next(e);
   }
 });
 
 api.post("/ingest/reading", async (req, res, next) => {
   try {
-    const { pinId, nodeType, sensorType, value, ts, status, raw } = req.body || {};
-    const safePinId = requireId(res, pinId, "pinId");
-    if (!safePinId) return;
-
-    const safeNodeType = String(nodeType || "");
-    if (!["air", "soil"].includes(safeNodeType)) {
-      return res.status(400).json({ message: "nodeType must be air or soil" });
-    }
-
-    const found = await findPlotByPinId(safePinId);
-    if (!found?.pin) return res.status(404).json({ message: "Pin not found" });
-
-    const match = findSensorByTypeInPin(found.pin, safeNodeType, sensorType);
-    if (!match?.sensor) {
-      return res
-        .status(404)
-        .json({ message: "Sensor not found for given nodeType/sensorType" });
-    }
-
-    const item = await createReadingAndUpdateNode({
-      pinId: safePinId,
-      sensorId: String(match.sensor.id),
-      value,
-      ts,
-      status,
-      raw,
-    });
-
+    const item = await appendReadingAndUpdateLatest(req.body || {});
     res.status(201).json({ item });
   } catch (e) {
-    if (e.statusCode) return res.status(e.statusCode).json({ message: e.message });
     next(e);
   }
 });
 
 api.get("/readings", async (req, res, next) => {
   try {
-    const { plotId, pinId, sensorType, nodeType, from, to, nodeId } = req.query || {};
-
-    const snap = await firestore
-      .collection(COLLECTIONS.readings)
-      .orderBy("ts", "asc")
-      .get();
-
-    let items = snap.docs.map((d) => withId(d.id, d.data()));
-
-    if (plotId) items = items.filter((x) => String(x.plotId) === String(plotId));
-    if (pinId) items = items.filter((x) => String(x.pinId) === String(pinId));
-    if (nodeId) items = items.filter((x) => String(x.nodeId) === String(nodeId));
-    if (sensorType && sensorType !== "all") {
-      items = items.filter((x) => x.sensorType === String(sensorType));
-    }
-    if (nodeType && nodeType !== "all") {
-      items = items.filter((x) => x.nodeType === String(nodeType));
-    }
-    if (from) items = items.filter((x) => String(x.ts) >= String(from));
-    if (to) items = items.filter((x) => String(x.ts) <= String(to));
-
+    const items = await getCollectionItems(COLLECTIONS.readings);
     res.json({ items });
   } catch (e) {
     next(e);
@@ -1679,45 +1572,27 @@ api.get("/plots/:plotId/summary", async (req, res, next) => {
     const plot = await getPlotById(plotId);
     if (!plot) return res.status(404).json({ message: "Plot not found" });
 
-    const pinIds = (plot?.polygon?.pins || []).map((p) => String(p.id));
+    const pins = plot?.polygon?.pins || [];
+    const nodeAirCount = pins.reduce((sum, pin) => sum + (pin.node_air || []).length, 0);
+    const nodeSoilCount = pins.reduce((sum, pin) => sum + (pin.node_soil || []).length, 0);
+    const sensorCount = pins.reduce(
+      (sum, pin) =>
+        sum +
+        (pin.node_air || []).reduce((a, n) => a + (n.sensors || []).length, 0) +
+        (pin.node_soil || []).reduce((a, n) => a + (n.sensors || []).length, 0),
+      0
+    );
 
-    const snap = await firestore
-      .collection(COLLECTIONS.readings)
-      .where("plotId", "==", plotId)
-      .orderBy("ts", "asc")
-      .get();
-
-    const readings = snap.docs
-      .map((d) => withId(d.id, d.data()))
-      .filter((r) => pinIds.includes(String(r.pinId)));
-
-    const map = new Map();
-    for (const r of readings) {
-      const key = `${r.nodeType}:${r.sensorId}:${r.sensorType}`;
-      if (!map.has(key)) map.set(key, []);
-      map.get(key).push(r);
-    }
-
-    const items = [];
-    for (const list of map.values()) {
-      const values = list.map((x) => Number(x.value)).filter(Number.isFinite);
-      if (!values.length) continue;
-
-      const last = list[list.length - 1];
-      items.push({
-        nodeId: String(last.nodeId),
-        nodeType: last.nodeType,
-        sensorId: String(last.sensorId),
-        sensorType: last.sensorType,
-        min: Math.min(...values),
-        max: Math.max(...values),
-        avg: values.reduce((a, b) => a + b, 0) / values.length,
-        last: last.value,
-        lastAt: last.ts,
-      });
-    }
-
-    res.json({ plotId, items });
+    res.json({
+      item: {
+        plotId: plot.id,
+        plotName: plot.plotName || plot.name || "",
+        pinCount: pins.length,
+        nodeAirCount,
+        nodeSoilCount,
+        sensorCount,
+      },
+    });
   } catch (e) {
     next(e);
   }
@@ -1725,15 +1600,20 @@ api.get("/plots/:plotId/summary", async (req, res, next) => {
 
 app.use("/api", api);
 
+app.use((req, res) => {
+  res.status(404).json({ message: `Cannot ${req.method} ${req.originalUrl}` });
+});
+
 app.use((err, req, res, next) => {
-  console.error(err);
-  res.status(500).json({
-    message: "Internal Server Error",
-    error: String(err.message || err),
+  console.error("[ERROR]", err);
+  const status = Number(err?.statusCode || err?.status || 500);
+  res.status(status).json({
+    message: status >= 500 ? "Internal Server Error" : err.message || "Request failed",
+    error: String(err?.message || err),
   });
 });
 
 const PORT = Number(process.env.PORT || 3001);
 app.listen(PORT, () => {
-  console.log(`[API] running on port ${PORT}`);
+  console.log(`Server running on http://localhost:${PORT}`);
 });
