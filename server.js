@@ -5,6 +5,7 @@ const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const { google } = require("googleapis");
 const admin = require("firebase-admin");
+const nodemailer = require("nodemailer");
 
 if (!admin.apps.length) {
   admin.initializeApp({
@@ -32,6 +33,7 @@ const COLLECTIONS = {
   nodes: "nodeTemplates",
   readings: "sensorReadings",
   users: "users",
+  passwordOtps: "passwordOtps",
 };
 
 console.log("========================================");
@@ -42,6 +44,75 @@ console.log("========================================");
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
+const mailer = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: process.env.MAIL_USER,
+    pass: process.env.MAIL_PASS,
+  },
+});
+
+function generateOtp() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+function getOtpTtlMs() {
+  const ttlMin = Number(process.env.OTP_TTL_MIN || 10);
+  return ttlMin * 60 * 1000;
+}
+
+async function savePasswordOtp(email, code) {
+  const safeEmail = String(email || "").trim().toLowerCase();
+  await firestore.collection(COLLECTIONS.passwordOtps).doc(safeEmail).set({
+    email: safeEmail,
+    code: String(code),
+    verified: false,
+    createdAt: nowIso(),
+    expiresAt: Date.now() + getOtpTtlMs(),
+  });
+}
+
+async function getPasswordOtp(email) {
+  const safeEmail = String(email || "").trim().toLowerCase();
+  const doc = await firestore.collection(COLLECTIONS.passwordOtps).doc(safeEmail).get();
+  if (!doc.exists) return null;
+  return doc.data();
+}
+
+async function markPasswordOtpVerified(email) {
+  const safeEmail = String(email || "").trim().toLowerCase();
+  await firestore.collection(COLLECTIONS.passwordOtps).doc(safeEmail).set(
+    {
+      verified: true,
+      verifiedAt: nowIso(),
+    },
+    { merge: true }
+  );
+}
+
+async function deletePasswordOtp(email) {
+  const safeEmail = String(email || "").trim().toLowerCase();
+  await firestore.collection(COLLECTIONS.passwordOtps).doc(safeEmail).delete();
+}
+
+async function sendOtpEmail(toEmail, otp) {
+  const ttlMin = Number(process.env.OTP_TTL_MIN || 10);
+
+  return await mailer.sendMail({
+    from: `"DuWIMS" <${process.env.MAIL_USER}>`,
+    to: toEmail,
+    subject: "OTP สำหรับรีเซ็ตรหัสผ่าน",
+    text: `รหัส OTP ของคุณคือ ${otp} และจะหมดอายุใน ${ttlMin} นาที`,
+    html: `
+      <div style="font-family:Arial,sans-serif;line-height:1.6">
+        <h2>รีเซ็ตรหัสผ่าน</h2>
+        <p>รหัส OTP ของคุณคือ</p>
+        <div style="font-size:32px;font-weight:700;letter-spacing:6px">${otp}</div>
+        <p>OTP นี้จะหมดอายุใน ${ttlMin} นาที</p>
+      </div>
+    `,
+  });
+}
 
 app.get("/__version", (req, res) => {
   res.json({ build: BUILD_TAG, file: __filename, cwd: process.cwd() });
@@ -768,6 +839,146 @@ app.post("/auth/login", async (req, res) => {
     return res
       .status(500)
       .json({ message: "server error", error: String(e.message || e) });
+  }
+});
+app.post("/auth/forgot", async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    if (!email) {
+      return res.status(400).json({ message: "email required" });
+    }
+
+    const user = await getUserByEmail(email);
+
+    // ป้องกันการเดา email ว่ามีในระบบไหม
+    if (!user) {
+      return res.json({
+        ok: true,
+        message: "If this email exists, OTP has been sent",
+      });
+    }
+
+    if (!process.env.MAIL_USER || !process.env.MAIL_PASS) {
+      return res.status(500).json({
+        message: "Mail service is not configured",
+      });
+    }
+
+    const otp = generateOtp();
+    await savePasswordOtp(email, otp);
+    await sendOtpEmail(email, otp);
+
+    return res.json({
+      ok: true,
+      message: "OTP has been sent to your email",
+    });
+  } catch (e) {
+    return res.status(500).json({
+      message: "Failed to send OTP",
+      error: String(e.message || e),
+    });
+  }
+});
+
+app.post("/auth/verify-otp", async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const code = String(req.body?.code || "").trim();
+
+    if (!email || !code) {
+      return res.status(400).json({ message: "email/code required" });
+    }
+
+    const otpDoc = await getPasswordOtp(email);
+    if (!otpDoc) {
+      return res.status(400).json({ message: "OTP not found" });
+    }
+
+    if (Date.now() > Number(otpDoc.expiresAt || 0)) {
+      await deletePasswordOtp(email);
+      return res.status(400).json({ message: "OTP expired" });
+    }
+
+    if (String(otpDoc.code) !== code) {
+      return res.status(400).json({ message: "OTP invalid" });
+    }
+
+    await markPasswordOtpVerified(email);
+
+    return res.json({
+      ok: true,
+      message: "OTP verified",
+    });
+  } catch (e) {
+    return res.status(500).json({
+      message: "Verify OTP failed",
+      error: String(e.message || e),
+    });
+  }
+});
+
+app.post("/auth/reset-password", async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const code = String(req.body?.code || "").trim();
+    const newPassword = String(req.body?.newPassword || "");
+
+    if (!email || !code || !newPassword) {
+      return res.status(400).json({
+        message: "email/code/newPassword required",
+      });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({
+        message: "Password must be at least 6 characters",
+      });
+    }
+
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const otpDoc = await getPasswordOtp(email);
+    if (!otpDoc) {
+      return res.status(400).json({ message: "OTP not found" });
+    }
+
+    if (Date.now() > Number(otpDoc.expiresAt || 0)) {
+      await deletePasswordOtp(email);
+      return res.status(400).json({ message: "OTP expired" });
+    }
+
+    if (String(otpDoc.code) !== code) {
+      return res.status(400).json({ message: "OTP invalid" });
+    }
+
+    if (!otpDoc.verified) {
+      return res.status(400).json({ message: "OTP not verified yet" });
+    }
+
+    const password_hash = await bcrypt.hash(newPassword, 10);
+
+    await firestore.collection(COLLECTIONS.users).doc(String(user.id)).set(
+      {
+        password_hash,
+        updatedAt: nowIso(),
+      },
+      { merge: true }
+    );
+
+    await deletePasswordOtp(email);
+
+    return res.json({
+      ok: true,
+      message: "Password reset successful",
+    });
+  } catch (e) {
+    return res.status(500).json({
+      message: "Reset password failed",
+      error: String(e.message || e),
+    });
   }
 });
 
