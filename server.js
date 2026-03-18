@@ -707,6 +707,34 @@ app.get("/auth/google", (req, res) => {
   });
   res.json({ url });
 });
+app.get("/auth/me", auth, async (req, res) => {
+  res.json({ user: req.user });
+});
+
+app.get("/auth/google/start", (req, res) => {
+  try {
+    const url = googleOAuth2Client.generateAuthUrl({
+      access_type: "offline",
+      prompt: "consent",
+      scope: ["openid", "email", "profile"],
+    });
+
+    return res.redirect(url);
+  } catch (e) {
+    return res
+      .status(500)
+      .json({ message: "Google auth start failed", error: String(e.message || e) });
+  }
+});
+
+app.get("/auth/google", (req, res) => {
+  const url = googleOAuth2Client.generateAuthUrl({
+    access_type: "offline",
+    prompt: "consent",
+    scope: ["openid", "email", "profile"],
+  });
+  res.json({ url });
+});
 
 app.get("/auth/google/callback", async (req, res) => {
   try {
@@ -718,25 +746,31 @@ app.get("/auth/google/callback", async (req, res) => {
 
     const oauth2 = google.oauth2({ auth: googleOAuth2Client, version: "v2" });
     const me = await oauth2.userinfo.get();
+
     const email = me.data.email;
     const nickname = makeSafeNickname(me.data.name, email);
 
     const token = jwt.sign(
       { email, nickname, role: "employee" },
       process.env.JWT_SECRET,
-      {
-        expiresIn: "7d",
-      }
+      { expiresIn: "7d" }
     );
 
     const redirectBase = process.env.FRONTEND_URL || "http://localhost:3000";
-    return res.redirect(`${redirectBase}/?token=${encodeURIComponent(token)}`);
+
+    return res.redirect(
+      `${redirectBase}/login?token=${encodeURIComponent(token)}`
+    );
   } catch (e) {
-    return res
-      .status(500)
-      .json({ message: "Google auth failed", error: String(e.message || e) });
+    const redirectBase = process.env.FRONTEND_URL || "http://localhost:3000";
+    return res.redirect(
+      `${redirectBase}/login?error=${encodeURIComponent(
+        e?.message || "Google auth failed"
+      )}`
+    );
   }
 });
+
 
 api.use(auth);
 
