@@ -1066,6 +1066,36 @@ app.get("/auth/google/callback", async (req, res) => {
 });
 
 api.use(auth);
+api.get("/users", async (req, res, next) => {
+  try {
+    const role = String(req.query.role || "").trim().toLowerCase();
+
+    let ref = firestore.collection(COLLECTIONS.users);
+
+    if (role) {
+      ref = ref.where("role", "==", role);
+    }
+
+    const snap = await ref.get();
+
+    const items = snap.docs.map((doc) => {
+      const data = doc.data() || {};
+      return {
+        id: doc.id,
+        email: String(data.email || "").trim(),
+        nickname: String(data.nickname || "").trim(),
+        role: String(data.role || "").trim(),
+        provider: String(data.provider || "").trim(),
+        createdAt: data.createdAt || "",
+        updatedAt: data.updatedAt || "",
+      };
+    });
+
+    res.json({ items });
+  } catch (e) {
+    next(e);
+  }
+});
 
 api.get("/nodes", async (req, res, next) => {
   try {
