@@ -29,6 +29,7 @@ const COLLECTIONS = {
   managementPlants: "managementPlants",
   sensorReadings: "sensorReadings",
   passwordOtps: "passwordOtps",
+  emailVerifications: "emailVerifications",
 };
 
 app.use(cors());
@@ -179,6 +180,7 @@ async function createUser(input) {
     nickname: toTrimmed(input.nickname),
     role: toTrimmed(input.role || "employee") || "employee",
     provider: toTrimmed(input.provider || "local") || "local",
+    isEmailVerified: Boolean(input.isEmailVerified || false),
     createdAt: nowIso(),
     updatedAt: nowIso(),
   });
@@ -224,6 +226,62 @@ async function markPasswordOtpVerified(email) {
 async function deletePasswordOtp(email) {
   const safeEmail = toLowerTrimmed(email);
   await firestore.collection(COLLECTIONS.passwordOtps).doc(safeEmail).delete();
+}
+async function saveEmailVerification(email, code) {
+  const safeEmail = toLowerTrimmed(email);
+  await firestore.collection(COLLECTIONS.emailVerifications).doc(safeEmail).set({
+    email: safeEmail,
+    code: String(code),
+    verified: false,
+    createdAt: nowIso(),
+    expiresAt: Date.now() + getOtpTtlMs(),
+  });
+}
+
+async function getEmailVerification(email) {
+  const safeEmail = toLowerTrimmed(email);
+  const doc = await firestore
+    .collection(COLLECTIONS.emailVerifications)
+    .doc(safeEmail)
+    .get();
+  if (!doc.exists) return null;
+  return doc.data() || null;
+}
+
+async function markEmailVerificationVerified(email) {
+  const safeEmail = toLowerTrimmed(email);
+  await firestore.collection(COLLECTIONS.emailVerifications).doc(safeEmail).set(
+    {
+      verified: true,
+      verifiedAt: nowIso(),
+    },
+    { merge: true }
+  );
+}
+
+async function deleteEmailVerification(email) {
+  const safeEmail = toLowerTrimmed(email);
+  await firestore
+    .collection(COLLECTIONS.emailVerifications)
+    .doc(safeEmail)
+    .delete();
+}
+
+async function sendVerificationEmail(toEmail, code) {
+  return mailer.sendMail({
+    from: `"DuWIMS" <${process.env.MAIL_USER}>`,
+    to: toEmail,
+    subject: "ยืนยันอีเมลสำหรับสมัครสมาชิก DuWIMS",
+    text: `รหัสยืนยันอีเมลของคุณคือ ${code} และจะหมดอายุใน ${OTP_TTL_MIN} นาที`,
+    html: `
+      <div style="font-family:Arial,sans-serif;line-height:1.6">
+        <h2>ยืนยันอีเมล</h2>
+        <p>รหัสยืนยันอีเมลของคุณคือ</p>
+        <div style="font-size:32px;font-weight:700;letter-spacing:6px">${code}</div>
+        <p>รหัสนี้จะหมดอายุใน ${OTP_TTL_MIN} นาที</p>
+      </div>
+    `,
+  });
 }
 
 async function sendOtpEmail(toEmail, otp) {
@@ -305,8 +363,8 @@ function normalizeNode(input, existing = null) {
   const sensorsInput = Array.isArray(input?.sensors)
     ? input.sensors
     : Array.isArray(existing?.sensors)
-    ? existing.sensors
-    : [];
+      ? existing.sensors
+      : [];
 
   return cleanUndefined({
     _id: id,
@@ -449,8 +507,9 @@ app.post("/auth/register", async (req, res) => {
     if (!nickname) return;
 
     const safeEmail = toLowerTrimmed(email);
-    if (password.length < 6) {
-      return res.status(400).json({ message: "password must be at least 6 characters" });
+
+    if (password.length < 8) {
+      return res.status(400).json({ message: "password must be at least 8 characters" });
     }
 
     const exists = await getUserByEmail(safeEmail);
@@ -464,28 +523,119 @@ app.post("/auth/register", async (req, res) => {
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
+
     const user = await createUser({
       email: safeEmail,
       passwordHash,
       nickname,
       role: toTrimmed(req.body?.role || "employee") || "employee",
       provider: "local",
+      isEmailVerified: false,
     });
 
-    const token = buildAuthToken(user);
+    const code = generateOtp();
+    await saveEmailVerification(safeEmail, code);
+    await sendVerificationEmail(safeEmail, code);
+
     return res.status(201).json({
       ok: true,
-      token,
+      message: "Register success. Please verify your email.",
       user: {
         id: user.id,
         email: user.email,
         nickname: user.nickname,
         role: user.role,
         provider: user.provider,
+        isEmailVerified: false,
       },
     });
   } catch (e) {
-    return res.status(500).json({ message: "Register failed", error: String(e.message || e) });
+    return res.status(500).json({
+      message: "Register failed",
+      error: String(e.message || e),
+    });
+  }
+});
+app.post("/auth/send-email-verification", async (req, res) => {
+  try {
+    const email = requireStringField(res, req.body?.email, "email");
+    if (!email) return;
+
+    const safeEmail = toLowerTrimmed(email);
+    const user = await getUserByEmail(safeEmail);
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    if (user.provider === "google") {
+      return res.status(400).json({ message: "Google account does not require email verification" });
+    }
+
+    if (user.isEmailVerified) {
+      return res.json({ ok: true, message: "Email already verified" });
+    }
+
+    const code = generateOtp();
+    await saveEmailVerification(safeEmail, code);
+    await sendVerificationEmail(safeEmail, code);
+
+    return res.json({ ok: true, message: "Verification email sent" });
+  } catch (e) {
+    return res.status(500).json({
+      message: "Send email verification failed",
+      error: String(e.message || e),
+    });
+  }
+});
+app.post("/auth/verify-email", async (req, res) => {
+  try {
+    const email = requireStringField(res, req.body?.email, "email");
+    if (!email) return;
+    const code = requireStringField(res, req.body?.code, "code");
+    if (!code) return;
+
+    const safeEmail = toLowerTrimmed(email);
+    const user = await getUserByEmail(safeEmail);
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const saved = await getEmailVerification(safeEmail);
+    if (!saved) {
+      return res.status(404).json({ message: "Verification code not found" });
+    }
+
+    if (Date.now() > Number(saved.expiresAt || 0)) {
+      await deleteEmailVerification(safeEmail);
+      return res.status(400).json({ message: "Verification code expired" });
+    }
+
+    if (String(saved.code) !== String(code)) {
+      return res.status(400).json({ message: "Invalid verification code" });
+    }
+
+    await firestore.collection(COLLECTIONS.users).doc(user.id).set(
+      {
+        isEmailVerified: true,
+        updatedAt: nowIso(),
+      },
+      { merge: true }
+    );
+
+    await markEmailVerificationVerified(safeEmail);
+    await deleteEmailVerification(safeEmail);
+
+    return res.json({
+      ok: true,
+      message: "Email verified successfully",
+    });
+  } catch (e) {
+    return res.status(500).json({
+      message: "Verify email failed",
+      error: String(e.message || e),
+    });
   }
 });
 
@@ -499,6 +649,10 @@ app.post("/auth/login", async (req, res) => {
     const user = await getUserByEmail(email);
     if (!user || !user.passwordHash) {
       return res.status(401).json({ message: "Invalid email or password" });
+    }
+
+    if (user.provider !== "google" && !user.isEmailVerified) {
+      return res.status(403).json({ message: "Please verify your email before login" });
     }
 
     const ok = await bcrypt.compare(password, user.passwordHash);
@@ -516,6 +670,7 @@ app.post("/auth/login", async (req, res) => {
         nickname: user.nickname,
         role: user.role,
         provider: user.provider,
+        isEmailVerified: !!user.isEmailVerified,
       },
     });
   } catch (e) {
@@ -661,6 +816,7 @@ app.get("/auth/google/callback", async (req, res) => {
         nickname,
         role: "employee",
         provider: "google",
+        isEmailVerified: true,
       });
     }
 
@@ -1029,16 +1185,72 @@ api.patch("/plots/:plotId/nodes/:nodeId/sensors/:sensorId", async (req, res, nex
     if (sensorIndex < 0) return res.status(404).json({ message: "sensor not found" });
 
     const existing = sensors[sensorIndex];
-    const next = normalizeSensor({ ...existing, ...req.body }, existing);
-    if (!next.name) return res.status(400).json({ message: "sensor name is required" });
-    if (!next.uid) return res.status(400).json({ message: "sensor uid is required" });
+    const nextSensor = normalizeSensor({ ...existing, ...req.body }, existing);
+
+    if (!nextSensor.name) return res.status(400).json({ message: "sensor name is required" });
+    if (!nextSensor.uid) return res.status(400).json({ message: "sensor uid is required" });
 
     const dupUid = sensors.find(
-      (s, i) => i !== sensorIndex && String(s?.uid) === String(next.uid)
+      (s, i) => i !== sensorIndex && String(s?.uid) === String(nextSensor.uid)
     );
-    if (dupUid) return res.status(409).json({ message: "sensor uid already exists in this node" });
+    if (dupUid) {
+      return res.status(409).json({ message: "sensor uid already exists in this node" });
+    }
 
-    sensors[sensorIndex] = next;
+    // ===== เก็บค่าเก่าลง sensorReadings อัตโนมัติ เมื่อมี latestValue ใหม่เข้ามา =====
+    const hasIncomingLatestValue = req.body?.latestValue !== undefined;
+    const incomingLatestValue = hasIncomingLatestValue
+      ? toNumberOrNull(req.body.latestValue)
+      : undefined;
+
+    if (hasIncomingLatestValue && incomingLatestValue === null) {
+      return res.status(400).json({ message: "latestValue must be a number" });
+    }
+
+    const incomingLatestTimestamp =
+      req.body?.latestTimestamp !== undefined
+        ? (req.body.latestTimestamp && isIsoDateLike(req.body.latestTimestamp)
+          ? req.body.latestTimestamp
+          : nowIso())
+        : undefined;
+
+    const oldValue = toNumberOrNull(existing?.latestValue);
+    const oldTimestamp =
+      existing?.latestTimestamp && isIsoDateLike(existing.latestTimestamp)
+        ? existing.latestTimestamp
+        : null;
+
+    if (hasIncomingLatestValue && oldValue !== null) {
+      const historyReading = cleanUndefined({
+        plotId: String(req.params.plotId),
+        nodeId: String(req.params.nodeId),
+        sensorId: String(req.params.sensorId),
+        sensorName: existing?.name || nextSensor?.name || "",
+        value: oldValue,
+        timestamp: oldTimestamp || nowIso(),
+        status: toTrimmed(existing?.status || "OK") || "OK",
+        createdAt: nowIso(),
+      });
+
+      const readingId = makeId("reading");
+      await firestore
+        .collection(COLLECTIONS.sensorReadings)
+        .doc(readingId)
+        .set(historyReading);
+    }
+
+    // ถ้ามี latestValue ใหม่เข้ามา แต่ไม่ได้ส่ง latestTimestamp มา
+    // ให้ถือว่าเวลาปัจจุบัน
+    if (hasIncomingLatestValue && req.body?.latestTimestamp === undefined) {
+      nextSensor.latestTimestamp = nowIso();
+    }
+
+    // ถ้าส่ง latestTimestamp มาด้วย ให้ใช้ค่าที่ผ่าน validation แล้ว
+    if (incomingLatestTimestamp !== undefined) {
+      nextSensor.latestTimestamp = incomingLatestTimestamp;
+    }
+
+    sensors[sensorIndex] = nextSensor;
     node.sensors = sensors;
     nodes[nodeIndex] = node;
 
@@ -1050,7 +1262,7 @@ api.patch("/plots/:plotId/nodes/:nodeId/sensors/:sensorId", async (req, res, nex
       { merge: true }
     );
 
-    res.json({ item: next });
+    res.json({ item: nextSensor });
   } catch (e) {
     next(e);
   }
