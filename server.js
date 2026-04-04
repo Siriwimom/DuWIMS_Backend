@@ -821,11 +821,11 @@ app.get("/auth/google/callback", async (req, res) => {
     }
 
     const token = buildAuthToken(user);
-    return res.redirect(`${FRONTEND_URL}/login?token=${encodeURIComponent(token)}`);
+    return res.redirect(`${FRONTEND_URL}/dashboard?token=${encodeURIComponent(token)}`);
   } catch (e) {
     return res.redirect(
-      `${FRONTEND_URL}/login?error=${encodeURIComponent(e?.message || "Google auth failed")}`
-    );
+  `${FRONTEND_URL}/?error=${encodeURIComponent(e?.message || "Google auth failed")}`
+);
   }
 });
 
@@ -1379,20 +1379,54 @@ api.get("/sensor-readings", async (req, res, next) => {
     const sensorId = toTrimmed(req.query.sensorId);
     const plotId = toTrimmed(req.query.plotId);
     const nodeId = toTrimmed(req.query.nodeId);
-    const limit = Math.min(Number(req.query.limit || 100), 500);
+    const limit = Math.max(1, Math.min(Number(req.query.limit || 2000), 5000));
 
-    let ref = firestore.collection(COLLECTIONS.sensorReadings);
-    if (sensorId) ref = ref.where("sensorId", "==", sensorId);
-    if (plotId) ref = ref.where("plotId", "==", plotId);
-    if (nodeId) ref = ref.where("nodeId", "==", nodeId);
+    const items = await fetchSensorReadingsNoIndexFallback({
+      sensorId,
+      plotId,
+      nodeId,
+      limit,
+    });
 
-    const snap = await ref.orderBy("timestamp", "desc").limit(limit).get();
-    const items = snap.docs.map((doc) => withId(doc.id, doc.data() || {}));
     res.json({ items });
   } catch (e) {
     next(e);
   }
 });
+function readingTimestampMs(item) {
+  const raw = item?.timestamp || item?.ts || item?.time || item?.createdAt || item?.updatedAt;
+  const ms = new Date(raw).getTime();
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function filterReadingItems(items, { sensorId = "", plotId = "", nodeId = "" } = {}) {
+  return (Array.isArray(items) ? items : []).filter((item) => {
+    if (sensorId && String(item?.sensorId || "").trim() !== String(sensorId).trim()) return false;
+    if (plotId && String(item?.plotId || "").trim() !== String(plotId).trim()) return false;
+    if (nodeId && String(item?.nodeId || "").trim() !== String(nodeId).trim()) return false;
+    return true;
+  });
+}
+
+async function fetchSensorReadingsNoIndexFallback({ sensorId = "", plotId = "", nodeId = "", limit = 2000 } = {}) {
+  const hardLimit = Math.max(1, Math.min(Number(limit) || 2000, 5000));
+  const collectionRef = firestore.collection(COLLECTIONS.sensorReadings);
+
+  const queryPlan = sensorId
+    ? collectionRef.where("sensorId", "==", sensorId)
+    : nodeId
+      ? collectionRef.where("nodeId", "==", nodeId)
+      : plotId
+        ? collectionRef.where("plotId", "==", plotId)
+        : collectionRef;
+
+  const snap = await queryPlan.limit(Math.max(hardLimit * 5, 500)).get();
+  const rawItems = snap.docs.map((doc) => withId(doc.id, doc.data() || {}));
+
+  return filterReadingItems(rawItems, { sensorId, plotId, nodeId })
+    .sort((a, b) => readingTimestampMs(b) - readingTimestampMs(a))
+    .slice(0, hardLimit);
+}
 
 api.post("/sensor-readings", async (req, res, next) => {
   try {
@@ -1446,16 +1480,10 @@ api.get("/sensor-readings/latest", async (req, res, next) => {
     const sensorId = requireStringField(res, req.query.sensorId, "sensorId");
     if (!sensorId) return;
 
-    const snap = await firestore
-      .collection(COLLECTIONS.sensorReadings)
-      .where("sensorId", "==", sensorId)
-      .orderBy("timestamp", "desc")
-      .limit(1)
-      .get();
+    const items = await fetchSensorReadingsNoIndexFallback({ sensorId, limit: 1 });
+    if (!items.length) return res.status(404).json({ message: "No readings found" });
 
-    if (snap.empty) return res.status(404).json({ message: "No readings found" });
-    const doc = snap.docs[0];
-    res.json({ item: withId(doc.id, doc.data() || {}) });
+    res.json({ item: items[0] });
   } catch (e) {
     next(e);
   }
