@@ -125,6 +125,20 @@ function buildAuthToken(user) {
   );
 }
 
+function sanitizeUser(user) {
+  if (!user) return null;
+  return {
+    id: user.id,
+    email: user.email || "",
+    nickname: user.nickname || "",
+    role: user.role || "",
+    provider: user.provider || "local",
+    isEmailVerified: !!user.isEmailVerified,
+    createdAt: user.createdAt || "",
+    updatedAt: user.updatedAt || "",
+  };
+}
+
 function auth(req, res, next) {
   const h = req.headers.authorization || "";
   const token = h.startsWith("Bearer ") ? h.slice(7) : null;
@@ -312,11 +326,6 @@ function normalizePolygon(input) {
 }
 
 function normalizePolygonPayload(body) {
-  // รองรับทั้ง
-  // { polygon: [{lat,lng}] }
-  // และ { coords: [{lat,lng}] }
-  // และ { polygon: { coords: [...] } }
-
   if (Array.isArray(body?.polygon)) {
     return normalizePolygon(body.polygon);
   }
@@ -831,13 +840,146 @@ app.get("/auth/google/callback", async (req, res) => {
     return res.redirect(`${FRONTEND_URL}/dashboard?token=${encodeURIComponent(token)}`);
   } catch (e) {
     return res.redirect(
-  `${FRONTEND_URL}/?error=${encodeURIComponent(e?.message || "Google auth failed")}`
-);
+      `${FRONTEND_URL}/?error=${encodeURIComponent(e?.message || "Google auth failed")}`
+    );
   }
 });
 
 app.get("/auth/me", auth, async (req, res) => {
   return res.json({ user: req.user });
+});
+
+app.patch("/auth/update-profile", auth, async (req, res) => {
+  try {
+    const userId = String(req.user?.id || "");
+    if (!userId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const user = await getDocById(COLLECTIONS.users, userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const nextNickname = toTrimmed(
+      req.body?.nickname ?? req.body?.displayName ?? req.body?.name
+    );
+
+    if (!nextNickname) {
+      return res.status(400).json({ message: "nickname is required" });
+    }
+
+    const nicknameExists = await getUserByNickname(nextNickname);
+    if (nicknameExists && String(nicknameExists.id) !== String(userId)) {
+      return res.status(409).json({ message: "nickname already exists" });
+    }
+
+    const patch = {
+      nickname: nextNickname,
+      updatedAt: nowIso(),
+    };
+
+    await firestore.collection(COLLECTIONS.users).doc(userId).set(patch, { merge: true });
+
+    const updatedUser = {
+      ...user,
+      ...patch,
+    };
+
+    const token = buildAuthToken(updatedUser);
+
+    return res.json({
+      ok: true,
+      message: "Profile updated successfully",
+      token,
+      user: sanitizeUser(updatedUser),
+    });
+  } catch (e) {
+    return res.status(500).json({
+      message: "Update profile failed",
+      error: String(e.message || e),
+    });
+  }
+});
+
+app.post("/auth/change-password", auth, async (req, res) => {
+  try {
+    const userId = String(req.user?.id || "");
+    if (!userId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const user = await getDocById(COLLECTIONS.users, userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    if (user.provider === "google") {
+      return res.status(400).json({
+        message: "Google account cannot change password with this method",
+      });
+    }
+
+    if (!user.passwordHash) {
+      return res.status(400).json({
+        message: "Password is not available for this account",
+      });
+    }
+
+    const currentPassword = toTrimmed(req.body?.currentPassword || req.body?.oldPassword);
+    const newPassword = toTrimmed(req.body?.newPassword || req.body?.password);
+    const confirmPassword = toTrimmed(req.body?.confirmPassword);
+
+    if (!currentPassword) {
+      return res.status(400).json({ message: "currentPassword is required" });
+    }
+
+    if (!newPassword) {
+      return res.status(400).json({ message: "newPassword is required" });
+    }
+
+    if (newPassword.length < 8) {
+      return res.status(400).json({
+        message: "newPassword must be at least 8 characters",
+      });
+    }
+
+    if (confirmPassword && newPassword !== confirmPassword) {
+      return res.status(400).json({ message: "confirmPassword does not match" });
+    }
+
+    const isCorrect = await bcrypt.compare(currentPassword, user.passwordHash);
+    if (!isCorrect) {
+      return res.status(400).json({ message: "Current password is incorrect" });
+    }
+
+    const isSamePassword = await bcrypt.compare(newPassword, user.passwordHash);
+    if (isSamePassword) {
+      return res.status(400).json({
+        message: "New password must be different from current password",
+      });
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+
+    await firestore.collection(COLLECTIONS.users).doc(userId).set(
+      {
+        passwordHash,
+        updatedAt: nowIso(),
+      },
+      { merge: true }
+    );
+
+    return res.json({
+      ok: true,
+      message: "Password changed successfully",
+    });
+  } catch (e) {
+    return res.status(500).json({
+      message: "Change password failed",
+      error: String(e.message || e),
+    });
+  }
 });
 
 api.use(auth);
@@ -1220,7 +1362,6 @@ api.patch("/plots/:plotId/nodes/:nodeId/sensors/:sensorId", async (req, res, nex
       return res.status(409).json({ message: "sensor uid already exists in this node" });
     }
 
-    // ===== เก็บค่าเก่าลง sensorReadings อัตโนมัติ เมื่อมี latestValue ใหม่เข้ามา =====
     const hasIncomingLatestValue = req.body?.latestValue !== undefined;
     const incomingLatestValue = hasIncomingLatestValue
       ? toNumberOrNull(req.body.latestValue)
@@ -1262,13 +1403,10 @@ api.patch("/plots/:plotId/nodes/:nodeId/sensors/:sensorId", async (req, res, nex
         .set(historyReading);
     }
 
-    // ถ้ามี latestValue ใหม่เข้ามา แต่ไม่ได้ส่ง latestTimestamp มา
-    // ให้ถือว่าเวลาปัจจุบัน
     if (hasIncomingLatestValue && req.body?.latestTimestamp === undefined) {
       nextSensor.latestTimestamp = nowIso();
     }
 
-    // ถ้าส่ง latestTimestamp มาด้วย ให้ใช้ค่าที่ผ่าน validation แล้ว
     if (incomingLatestTimestamp !== undefined) {
       nextSensor.latestTimestamp = incomingLatestTimestamp;
     }
