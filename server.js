@@ -380,9 +380,11 @@ function normalizeNode(input, existing = null) {
 }
 
 function normalizePlotCreate(body) {
+  const caretaker = toTrimmed(body.caretaker);
+
   return cleanUndefined({
     plotName: toTrimmed(body.plotName),
-    caretaker: toTrimmed(body.caretaker),
+    caretaker: caretaker || undefined,
     polygon: normalizePolygon(body.polygon),
     nodes: Array.isArray(body.nodes) ? body.nodes.map((n) => normalizeNode(n)) : [],
     createdAt: nowIso(),
@@ -391,11 +393,15 @@ function normalizePlotCreate(body) {
 }
 
 function normalizePlotPatch(existing, body) {
+  const caretaker =
+    body.caretaker !== undefined
+      ? toTrimmed(body.caretaker) || undefined
+      : existing.caretaker || undefined;
+
   const output = {
     plotName:
       body.plotName !== undefined ? toTrimmed(body.plotName) : existing.plotName || "",
-    caretaker:
-      body.caretaker !== undefined ? toTrimmed(body.caretaker) : existing.caretaker || "",
+    caretaker,
     polygon:
       body.polygon !== undefined ? normalizePolygon(body.polygon) : existing.polygon || [],
     nodes:
@@ -405,6 +411,7 @@ function normalizePlotPatch(existing, body) {
     createdAt: existing.createdAt || nowIso(),
     updatedAt: nowIso(),
   };
+
   return cleanUndefined(output);
 }
 
@@ -480,7 +487,7 @@ app.get("/__version", (req, res) => {
   res.json({ build: BUILD_TAG, file: __filename, cwd: process.cwd() });
 });
 
-app.get("/health", (req, res) => res.json({ ok: true, build: BUILD_TAG }));
+app.get("/health", (req, res) => res.json({ ok: true, build: BUILD_TAG ,message: "9/4/2025 - Server is healthy" }));
 
 app.get("/firestore/ping", async (req, res) => {
   try {
@@ -872,11 +879,16 @@ api.get("/plots", async (req, res, next) => {
 api.post("/plots", async (req, res, next) => {
   try {
     const data = normalizePlotCreate(req.body || {});
-    if (!data.plotName) return res.status(400).json({ message: "plotName is required" });
-    if (!data.caretaker) return res.status(400).json({ message: "caretaker is required" });
+    if (!data.plotName) {
+      return res.status(400).json({ message: "plotName is required" });
+    }
 
-    const caretaker = await getDocById(COLLECTIONS.users, data.caretaker);
-    if (!caretaker) return res.status(400).json({ message: "caretaker user not found" });
+    if (data.caretaker) {
+      const caretaker = await getDocById(COLLECTIONS.users, data.caretaker);
+      if (!caretaker) {
+        return res.status(400).json({ message: "caretaker user not found" });
+      }
+    }
 
     const id = makeId("plot");
     await firestore.collection(COLLECTIONS.plots).doc(id).set(data);
@@ -899,16 +911,27 @@ api.get("/plots/:plotId", async (req, res, next) => {
 api.patch("/plots/:plotId", async (req, res, next) => {
   try {
     const plot = await getDocById(COLLECTIONS.plots, req.params.plotId);
-    if (!plot) return res.status(404).json({ message: "plot not found" });
+    if (!plot) {
+      return res.status(404).json({ message: "plot not found" });
+    }
 
     const nextData = normalizePlotPatch(plot, req.body || {});
-    if (!nextData.plotName) return res.status(400).json({ message: "plotName is required" });
-    if (!nextData.caretaker) return res.status(400).json({ message: "caretaker is required" });
+    if (!nextData.plotName) {
+      return res.status(400).json({ message: "plotName is required" });
+    }
 
-    const caretaker = await getDocById(COLLECTIONS.users, nextData.caretaker);
-    if (!caretaker) return res.status(400).json({ message: "caretaker user not found" });
+    if (nextData.caretaker) {
+      const caretaker = await getDocById(COLLECTIONS.users, nextData.caretaker);
+      if (!caretaker) {
+        return res.status(400).json({ message: "caretaker user not found" });
+      }
+    }
 
-    await firestore.collection(COLLECTIONS.plots).doc(req.params.plotId).set(nextData, { merge: false });
+    await firestore
+      .collection(COLLECTIONS.plots)
+      .doc(req.params.plotId)
+      .set(nextData, { merge: false });
+
     res.json({ item: withId(req.params.plotId, nextData) });
   } catch (e) {
     next(e);
