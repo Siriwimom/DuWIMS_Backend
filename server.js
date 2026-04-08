@@ -517,10 +517,9 @@ app.post("/auth/register", async (req, res) => {
   try {
     const email = requireStringField(res, req.body?.email, "email");
     if (!email) return;
+
     const password = requireStringField(res, req.body?.password, "password");
     if (!password) return;
-    const nickname = requireStringField(res, req.body?.nickname, "nickname");
-    if (!nickname) return;
 
     const safeEmail = toLowerTrimmed(email);
 
@@ -533,17 +532,12 @@ app.post("/auth/register", async (req, res) => {
       return res.status(409).json({ message: "email already exists" });
     }
 
-    const nicknameExists = await getUserByNickname(nickname);
-    if (nicknameExists) {
-      return res.status(409).json({ message: "nickname already exists" });
-    }
-
     const passwordHash = await bcrypt.hash(password, 10);
 
     const user = await createUser({
       email: safeEmail,
       passwordHash,
-      nickname,
+      nickname: "",
       role: toTrimmed(req.body?.role || "employee") || "employee",
       provider: "local",
       isEmailVerified: false,
@@ -559,7 +553,7 @@ app.post("/auth/register", async (req, res) => {
       user: {
         id: user.id,
         email: user.email,
-        nickname: user.nickname,
+        nickname: user.nickname || "",
         role: user.role,
         provider: user.provider,
         isEmailVerified: false,
@@ -862,12 +856,17 @@ app.patch("/auth/update-profile", auth, async (req, res) => {
     }
 
     const nextNickname = toTrimmed(
-      req.body?.nickname ?? req.body?.displayName ?? req.body?.name
-    );
+  req.body?.nickname ?? req.body?.displayName ?? req.body?.name
+);
 
-    if (!nextNickname) {
-      return res.status(400).json({ message: "nickname is required" });
-    }
+if (!nextNickname) {
+  return res.json({
+    ok: true,
+    message: "No profile changes",
+    token: buildAuthToken(user),
+    user: sanitizeUser(user),
+  });
+}
 
     const nicknameExists = await getUserByNickname(nextNickname);
     if (nicknameExists && String(nicknameExists.id) !== String(userId)) {
