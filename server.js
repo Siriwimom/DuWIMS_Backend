@@ -119,6 +119,8 @@ function buildAuthToken(user) {
       nickname: user.nickname,
       role: user.role,
       provider: user.provider || "local",
+      ownerUid: user.ownerUid || "",
+      ownerRef: user.ownerRef || "",
     },
     process.env.JWT_SECRET,
     { expiresIn: JWT_EXPIRES_IN }
@@ -132,6 +134,8 @@ function sanitizeUser(user) {
     email: user.email || "",
     nickname: user.nickname || "",
     role: user.role || "",
+    ownerUid: user.ownerUid || "",
+    ownerRef: user.ownerRef || "",
     provider: user.provider || "local",
     isEmailVerified: !!user.isEmailVerified,
     createdAt: user.createdAt || "",
@@ -173,31 +177,70 @@ async function getUserByEmail(email) {
   return withId(doc.id, doc.data() || {});
 }
 
-async function getUserByNickname(nickname) {
-  const safe = toTrimmed(nickname);
+
+
+async function getUniqueOwnerUid() {
+  while (true) {
+    const candidate = generateOwnerUid();
+    const existing = await getUserByOwnerUid(candidate);
+    if (!existing) return candidate;
+  }
+}
+
+async function getUserByOwnerUid(ownerUid) {
+  const safe = toTrimmed(ownerUid);
   if (!safe) return null;
+
   const snap = await firestore
     .collection(COLLECTIONS.users)
-    .where("nickname", "==", safe)
+    .where("ownerUid", "==", safe)
+    .where("role", "==", "owner")
     .limit(1)
     .get();
+
   if (snap.empty) return null;
   const doc = snap.docs[0];
   return withId(doc.id, doc.data() || {});
 }
 
+function getOwnerScope(user) {
+  if (!user) return "";
+  if (String(user.role || "").toLowerCase() === "owner") return String(user.id || "");
+  return String(user.ownerRef || "");
+}
+
+function canAccessOwnedDoc(user, ownerRef) {
+  return String(getOwnerScope(user)) === String(ownerRef || "");
+}
+
 async function createUser(input) {
   const id = makeId("user");
+  const role = toTrimmed(input.role || "employee") || "employee";
+
+  let ownerUid = "";
+  let ownerRef = "";
+
+  if (role === "owner") {
+    ownerUid = await getUniqueOwnerUid();
+    ownerRef = id;
+  } else {
+    ownerUid = "";
+    ownerRef = "";
+  }
+
   const doc = cleanUndefined({
     email: toLowerTrimmed(input.email),
     passwordHash: input.passwordHash || "",
     nickname: toTrimmed(input.nickname),
-    role: toTrimmed(input.role || "employee") || "employee",
+    role,
+    ownerUid,
+    ownerRef,
     provider: toTrimmed(input.provider || "local") || "local",
     isEmailVerified: Boolean(input.isEmailVerified || false),
     createdAt: nowIso(),
     updatedAt: nowIso(),
   });
+
   await firestore.collection(COLLECTIONS.users).doc(id).set(doc);
   return withId(id, doc);
 }
@@ -491,12 +534,36 @@ async function syncLatestSensorState({ plotId, nodeId, sensorId, value, timestam
 
   return true;
 }
+function generateOwnerUid() {
+  return `DW-${Math.random().toString(36).slice(2, 6).toUpperCase()}${Date.now()
+    .toString(36)
+    .slice(-4)
+    .toUpperCase()}`;
+}
+
+async function getUserByOwnerUid(ownerUid) {
+  const snap = await firestore
+    .collection(COLLECTIONS.users)
+    .where("ownerUid", "==", ownerUid)
+    .where("role", "==", "owner")
+    .limit(1)
+    .get();
+
+  if (snap.empty) return null;
+  const doc = snap.docs[0];
+  return withId(doc.id, doc.data());
+}
+
+function getOwnerScope(user) {
+  if (user.role === "owner") return user.id;
+  return user.ownerRef;
+}
 
 app.get("/__version", (req, res) => {
   res.json({ build: BUILD_TAG, file: __filename, cwd: process.cwd() });
 });
 
-app.get("/health", (req, res) => res.json({ ok: true, build: BUILD_TAG ,message: "9/4/2025 - Server is healthy" }));
+app.get("/health", (req, res) => res.json({ ok: true, build: BUILD_TAG, message: "9/4/2025 - Server is healthy" }));
 
 app.get("/firestore/ping", async (req, res) => {
   try {
@@ -534,11 +601,15 @@ app.post("/auth/register", async (req, res) => {
 
     const passwordHash = await bcrypt.hash(password, 10);
 
+
+
+    const role = toTrimmed(req.body?.role || "employee") || "employee";
+
     const user = await createUser({
       email: safeEmail,
       passwordHash,
       nickname: "",
-      role: toTrimmed(req.body?.role || "employee") || "employee",
+      role,
       provider: "local",
       isEmailVerified: false,
     });
@@ -786,14 +857,25 @@ app.get("/auth/google", (req, res) => {
 
 app.get("/auth/google/start", (req, res) => {
   try {
+    const role = toTrimmed(req.query.role || "employee") || "employee";
+
+    const state = Buffer.from(
+      JSON.stringify({ role })
+    ).toString("base64");
+
     const url = googleOAuth2Client.generateAuthUrl({
       access_type: "offline",
       prompt: "consent",
       scope: ["openid", "email", "profile"],
+      state,
     });
+
     return res.redirect(url);
   } catch (e) {
-    return res.status(500).json({ message: "Google auth start failed", error: String(e.message || e) });
+    return res.status(500).json({
+      message: "Google auth start failed",
+      error: String(e.message || e),
+    });
   }
 });
 
@@ -820,11 +902,23 @@ app.get("/auth/google/callback", async (req, res) => {
       if (exists) {
         nickname = `${nickname}_${Date.now().toString().slice(-6)}`.slice(0, 100);
       }
+
+      let role = "employee";
+
+      if (req.query.state) {
+        try {
+          const parsed = JSON.parse(
+            Buffer.from(String(req.query.state), "base64").toString()
+          );
+          role = toTrimmed(parsed?.role || "employee") || "employee";
+        } catch { }
+      }
+
       user = await createUser({
         email,
         passwordHash: "",
         nickname,
-        role: "employee",
+        role,
         provider: "google",
         isEmailVerified: true,
       });
@@ -840,7 +934,24 @@ app.get("/auth/google/callback", async (req, res) => {
 });
 
 app.get("/auth/me", auth, async (req, res) => {
-  return res.json({ user: req.user });
+  try {
+    const userId = String(req.user?.id || "");
+    if (!userId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const user = await getDocById(COLLECTIONS.users, userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    return res.json({ user: sanitizeUser(user) });
+  } catch (e) {
+    return res.status(500).json({
+      message: "Get current user failed",
+      error: String(e.message || e),
+    });
+  }
 });
 
 app.patch("/auth/update-profile", auth, async (req, res) => {
@@ -856,17 +967,17 @@ app.patch("/auth/update-profile", auth, async (req, res) => {
     }
 
     const nextNickname = toTrimmed(
-  req.body?.nickname ?? req.body?.displayName ?? req.body?.name
-);
+      req.body?.nickname ?? req.body?.displayName ?? req.body?.name
+    );
 
-if (!nextNickname) {
-  return res.json({
-    ok: true,
-    message: "No profile changes",
-    token: buildAuthToken(user),
-    user: sanitizeUser(user),
-  });
-}
+    if (!nextNickname) {
+      return res.json({
+        ok: true,
+        message: "No profile changes",
+        token: buildAuthToken(user),
+        user: sanitizeUser(user),
+      });
+    }
 
     const nicknameExists = await getUserByNickname(nextNickname);
     if (nicknameExists && String(nicknameExists.id) !== String(userId)) {
@@ -980,27 +1091,98 @@ app.post("/auth/change-password", auth, async (req, res) => {
     });
   }
 });
+app.post("/auth/link-owner", auth, async (req, res) => {
+  try {
+    const userId = String(req.user?.id || "");
+    if (!userId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const ownerUid = toTrimmed(req.body?.ownerUid);
+    if (!ownerUid) {
+      return res.status(400).json({ message: "ownerUid is required" });
+    }
+
+    const user = await getDocById(COLLECTIONS.users, userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    if (String(user.role || "").toLowerCase() !== "employee") {
+      return res.status(400).json({ message: "Only employee can link owner UID" });
+    }
+
+    const owner = await getUserByOwnerUid(ownerUid);
+    if (!owner) {
+      return res.status(404).json({ message: "Owner UID not found" });
+    }
+
+    await firestore.collection(COLLECTIONS.users).doc(userId).set(
+      {
+        ownerUid: owner.ownerUid,
+        ownerRef: owner.id,
+        updatedAt: nowIso(),
+      },
+      { merge: true }
+    );
+
+    const updatedUser = {
+      ...user,
+      ownerUid: owner.ownerUid,
+      ownerRef: owner.id,
+      updatedAt: nowIso(),
+    };
+
+    const token = buildAuthToken(updatedUser);
+
+    return res.json({
+      ok: true,
+      message: "Linked owner successfully",
+      token,
+      user: sanitizeUser(updatedUser),
+    });
+  } catch (e) {
+    return res.status(500).json({
+      message: "Link owner failed",
+      error: String(e.message || e),
+    });
+  }
+});
 
 api.use(auth);
 
 api.get("/users", async (req, res, next) => {
   try {
-    let ref = firestore.collection(COLLECTIONS.users);
-    const role = toLowerTrimmed(req.query.role);
-    if (role) ref = ref.where("role", "==", role);
-    const snap = await ref.get();
-    const items = snap.docs.map((doc) => {
-      const data = doc.data() || {};
-      return {
-        id: doc.id,
+    const scopeOwnerRef = getOwnerScope(req.user);
+    if (!scopeOwnerRef) {
+      return res.json({ items: [] });
+    }
+
+    const snap = await firestore.collection(COLLECTIONS.users).get();
+
+    const items = snap.docs
+      .map((doc) => withId(doc.id, doc.data() || {}))
+      .filter((user) => {
+        const role = String(user.role || "").toLowerCase();
+
+        if (role === "owner") {
+          return String(user.id) === String(scopeOwnerRef);
+        }
+
+        return String(user.ownerRef || "") === String(scopeOwnerRef);
+      })
+      .map((data) => ({
+        id: data.id,
         email: data.email || "",
         nickname: data.nickname || "",
         role: data.role || "",
+        ownerUid: data.ownerUid || "",
+        ownerRef: data.ownerRef || "",
         provider: data.provider || "",
         createdAt: data.createdAt || "",
         updatedAt: data.updatedAt || "",
-      };
-    });
+      }));
+
     res.json({ items });
   } catch (e) {
     next(e);
@@ -1009,7 +1191,17 @@ api.get("/users", async (req, res, next) => {
 
 api.get("/plots", async (req, res, next) => {
   try {
-    const snap = await firestore.collection(COLLECTIONS.plots).orderBy("createdAt", "desc").get();
+    const ownerRef = getOwnerScope(req.user);
+
+    if (!ownerRef) {
+      return res.json({ items: [] });
+    }
+
+    const snap = await firestore
+      .collection(COLLECTIONS.plots)
+      .where("ownerRef", "==", ownerRef)
+      .get();
+
     const items = snap.docs.map((doc) => withId(doc.id, doc.data() || {}));
     res.json({ items });
   } catch (e) {
@@ -1019,7 +1211,15 @@ api.get("/plots", async (req, res, next) => {
 
 api.post("/plots", async (req, res, next) => {
   try {
-    const data = normalizePlotCreate(req.body || {});
+    const ownerRef = getOwnerScope(req.user);
+    if (!ownerRef) {
+      return res.status(400).json({ message: "No owner scope" });
+    }
+
+    const data = {
+      ...normalizePlotCreate(req.body || {}),
+      ownerRef,
+    };
     if (!data.plotName) {
       return res.status(400).json({ message: "plotName is required" });
     }
@@ -1043,7 +1243,922 @@ api.get("/plots/:plotId", async (req, res, next) => {
   try {
     const item = await getDocById(COLLECTIONS.plots, req.params.plotId);
     if (!item) return res.status(404).json({ message: "plot not found" });
+
+    if (!canAccessOwnedDoc(req.user, item.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
     res.json({ item });
+  } catch (e) {
+    next(e);
+  }
+});
+
+api.patch("/plots/:plotId", async (req, res, next) => {
+  try {
+    const plot = await getDocById(COLLECTIONS.plots, req.params.plotId);
+    if (!plot) {
+      return res.status(404).json({ message: "plot not found" });
+    }
+
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const nextData = normalizePlotPatch(plot, req.body || {});
+    nextData.ownerRef = plot.ownerRef;
+
+    if (!nextData.plotName) {
+      return res.status(400).json({ message: "plotName is required" });
+    }
+
+    if (nextData.caretaker) {
+      const caretaker = await getDocById(COLLECTIONS.users, nextData.caretaker);
+      if (!caretaker) {
+        return res.status(400).json({ message: "caretaker user not found" });
+      }
+    }
+
+    await firestore
+      .collection(COLLECTIONS.plots)
+      .doc(req.params.plotId)
+      .set(nextData, { merge: false });
+
+    res.json({ item: withId(req.params.plotId, nextData) });
+  } catch (e) {
+    next(e);
+  }
+});
+
+api.delete("/plots/:plotId", async (req, res, next) => {
+  try {
+    const plotId = String(req.params.plotId);
+    const plot = await getDocById(COLLECTIONS.plots, plotId);
+    if (!plot) return res.status(404).json({ message: "plot not found" });
+
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    await firestore.collection(COLLECTIONS.plots).doc(plotId).delete();
+
+    const mgmtSnap = await firestore
+      .collection(COLLECTIONS.managementPlants)
+      .where("plot", "==", plotId)
+      .get();
+
+    const readingsSnap = await firestore
+      .collection(COLLECTIONS.sensorReadings)
+      .where("plotId", "==", plotId)
+      .get();
+
+    const batch = firestore.batch();
+    mgmtSnap.docs.forEach((doc) => batch.delete(doc.ref));
+    readingsSnap.docs.forEach((doc) => batch.delete(doc.ref));
+    await batch.commit();
+
+    res.json({ ok: true, deletedId: plotId });
+  } catch (e) {
+    next(e);
+  }
+});
+
+api.put("/plots/:plotId/polygon", async (req, res, next) => {
+  try {
+    const plot = await getDocById(COLLECTIONS.plots, req.params.plotId);
+    if (!plot) return res.status(404).json({ message: "plot not found" });
+
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const polygon = normalizePolygonPayload(req.body || {});
+    if (polygon.length < 3) {
+      return res.status(400).json({ message: "polygon must have at least 3 points" });
+    }
+
+    await firestore.collection(COLLECTIONS.plots).doc(req.params.plotId).set(
+      {
+        polygon,
+        updatedAt: nowIso(),
+      },
+      { merge: true }
+    );
+
+    res.json({
+      ok: true,
+      item: {
+        plotId: req.params.plotId,
+        coords: polygon,
+      },
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+api.get("/plots/:plotId/polygon", async (req, res, next) => {
+  try {
+    const plot = await getDocById(COLLECTIONS.plots, req.params.plotId);
+    if (!plot) return res.status(404).json({ message: "plot not found" });
+
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const polygon = normalizePolygon(plot.polygon || []);
+
+    res.json({
+      item: {
+        plotId: req.params.plotId,
+        coords: polygon,
+      },
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+api.delete("/plots/:plotId/polygon", async (req, res, next) => {
+  try {
+    const plot = await getDocById(COLLECTIONS.plots, req.params.plotId);
+    if (!plot) return res.status(404).json({ message: "plot not found" });
+
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    await firestore.collection(COLLECTIONS.plots).doc(req.params.plotId).set(
+      {
+        polygon: [],
+        updatedAt: nowIso(),
+      },
+      { merge: true }
+    );
+
+    res.json({
+      ok: true,
+      item: {
+        plotId: req.params.plotId,
+        coords: [],
+      },
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+api.post("/plots/:plotId/nodes", async (req, res, next) => {
+  try {
+    const plot = await getDocById(COLLECTIONS.plots, req.params.plotId);
+    if (!plot) return res.status(404).json({ message: "plot not found" });
+
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const node = normalizeNode(req.body || {});
+    if (!node.nodeName) return res.status(400).json({ message: "nodeName is required" });
+    if (!node.uid) return res.status(400).json({ message: "uid is required" });
+    if (node.lat === null || node.lng === null) {
+      return res.status(400).json({ message: "lat and lng are required" });
+    }
+
+    const nodes = Array.isArray(plot.nodes) ? plot.nodes : [];
+    const dupUid = nodes.find((n) => String(n?.uid) === String(node.uid));
+    if (dupUid) return res.status(409).json({ message: "node uid already exists in this plot" });
+
+    const nextNodes = [...nodes, node];
+    await firestore.collection(COLLECTIONS.plots).doc(req.params.plotId).set(
+      {
+        nodes: nextNodes,
+        updatedAt: nowIso(),
+      },
+      { merge: true }
+    );
+
+    res.status(201).json({ item: node });
+  } catch (e) {
+    next(e);
+  }
+});
+
+api.patch("/plots/:plotId/nodes/:nodeId", async (req, res, next) => {
+  try {
+    const plot = await getDocById(COLLECTIONS.plots, req.params.plotId);
+    if (!plot) return res.status(404).json({ message: "plot not found" });
+
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const nodes = Array.isArray(plot.nodes) ? [...plot.nodes] : [];
+    const index = nodes.findIndex((n) => String(n?._id) === String(req.params.nodeId));
+    if (index < 0) return res.status(404).json({ message: "node not found" });
+
+    const existing = nodes[index];
+    const next = normalizeNode(
+      { ...existing, ...req.body, sensors: req.body?.sensors ?? existing.sensors },
+      existing
+    );
+
+    if (!next.nodeName) return res.status(400).json({ message: "nodeName is required" });
+    if (!next.uid) return res.status(400).json({ message: "uid is required" });
+    if (next.lat === null || next.lng === null) {
+      return res.status(400).json({ message: "lat and lng are required" });
+    }
+
+    const dupUid = nodes.find((n, i) => i !== index && String(n?.uid) === String(next.uid));
+    if (dupUid) return res.status(409).json({ message: "node uid already exists in this plot" });
+
+    nodes[index] = next;
+    await firestore.collection(COLLECTIONS.plots).doc(req.params.plotId).set(
+      {
+        nodes,
+        updatedAt: nowIso(),
+      },
+      { merge: true }
+    );
+
+    res.json({ item: next });
+  } catch (e) {
+    next(e);
+  }
+});
+
+api.delete("/plots/:plotId/nodes/:nodeId", async (req, res, next) => {
+  try {
+    const plotId = String(req.params.plotId);
+    const nodeId = String(req.params.nodeId);
+    const plot = await getDocById(COLLECTIONS.plots, plotId);
+    if (!plot) return res.status(404).json({ message: "plot not found" });
+
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const nodes = Array.isArray(plot.nodes) ? plot.nodes : [];
+    const found = nodes.find((n) => String(n?._id) === nodeId);
+    if (!found) return res.status(404).json({ message: "node not found" });
+
+    const nextNodes = nodes.filter((n) => String(n?._id) !== nodeId);
+    await firestore.collection(COLLECTIONS.plots).doc(plotId).set(
+      {
+        nodes: nextNodes,
+        updatedAt: nowIso(),
+      },
+      { merge: true }
+    );
+
+    const readingsSnap = await firestore
+      .collection(COLLECTIONS.sensorReadings)
+      .where("plotId", "==", plotId)
+      .where("nodeId", "==", nodeId)
+      .get();
+
+    const batch = firestore.batch();
+    readingsSnap.docs.forEach((doc) => batch.delete(doc.ref));
+    await batch.commit();
+
+    res.json({ ok: true, deletedId: nodeId });
+  } catch (e) {
+    next(e);
+  }
+});
+
+api.post("/plots/:plotId/nodes/:nodeId/sensors", async (req, res, next) => {
+  try {
+    const plot = await getDocById(COLLECTIONS.plots, req.params.plotId);
+    if (!plot) return res.status(404).json({ message: "plot not found" });
+
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const nodes = Array.isArray(plot.nodes) ? [...plot.nodes] : [];
+    const nodeIndex = nodes.findIndex((n) => String(n?._id) === String(req.params.nodeId));
+    if (nodeIndex < 0) return res.status(404).json({ message: "node not found" });
+
+    const node = { ...(nodes[nodeIndex] || {}) };
+    const sensors = Array.isArray(node.sensors) ? [...node.sensors] : [];
+    const sensor = normalizeSensor(req.body || {});
+
+    if (!sensor.name) return res.status(400).json({ message: "sensor name is required" });
+    if (!sensor.uid) return res.status(400).json({ message: "sensor uid is required" });
+
+    const dupUid = sensors.find((s) => String(s?.uid) === String(sensor.uid));
+    if (dupUid) return res.status(409).json({ message: "sensor uid already exists in this node" });
+
+    sensors.push(sensor);
+    node.sensors = sensors;
+    nodes[nodeIndex] = node;
+
+    await firestore.collection(COLLECTIONS.plots).doc(req.params.plotId).set(
+      {
+        nodes,
+        updatedAt: nowIso(),
+      },
+      { merge: true }
+    );
+
+    res.status(201).json({ item: sensor });
+  } catch (e) {
+    next(e);
+  }
+});
+
+api.patch("/plots/:plotId/nodes/:nodeId/sensors/:sensorId", async (req, res, next) => {
+  try {
+    const plot = await getDocById(COLLECTIONS.plots, req.params.plotId);
+    if (!plot) return res.status(404).json({ message: "plot not found" });
+
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const nodes = Array.isArray(plot.nodes) ? [...plot.nodes] : [];
+    const nodeIndex = nodes.findIndex((n) => String(n?._id) === String(req.params.nodeId));
+    if (nodeIndex < 0) return res.status(404).json({ message: "node not found" });
+
+    const node = { ...(nodes[nodeIndex] || {}) };
+    const sensors = Array.isArray(node.sensors) ? [...node.sensors] : [];
+    const sensorIndex = sensors.findIndex((s) => String(s?._id) === String(req.params.sensorId));
+    if (sensorIndex < 0) return res.status(404).json({ message: "sensor not found" });
+
+    const existing = sensors[sensorIndex];
+    const nextSensor = normalizeSensor({ ...existing, ...req.body }, existing);
+
+    if (!nextSensor.name) return res.status(400).json({ message: "sensor name is required" });
+    if (!nextSensor.uid) return res.status(400).json({ message: "sensor uid is required" });
+
+    const dupUid = sensors.find((s, i) => i !== sensorIndex && String(s?.uid) === String(nextSensor.uid));
+    if (dupUid) {
+      return res.status(409).json({ message: "sensor uid already exists in this node" });
+    }
+
+    const hasIncomingLatestValue = req.body?.latestValue !== undefined;
+    const incomingLatestValue = hasIncomingLatestValue
+      ? toNumberOrNull(req.body.latestValue)
+      : undefined;
+
+    if (hasIncomingLatestValue && incomingLatestValue === null) {
+      return res.status(400).json({ message: "latestValue must be a number" });
+    }
+
+    const incomingLatestTimestamp =
+      req.body?.latestTimestamp !== undefined
+        ? (req.body.latestTimestamp && isIsoDateLike(req.body.latestTimestamp)
+          ? req.body.latestTimestamp
+          : nowIso())
+        : undefined;
+
+    const oldValue = toNumberOrNull(existing?.latestValue);
+    const oldTimestamp =
+      existing?.latestTimestamp && isIsoDateLike(existing.latestTimestamp)
+        ? existing.latestTimestamp
+        : null;
+
+    if (hasIncomingLatestValue && oldValue !== null) {
+      const historyReading = cleanUndefined({
+        plotId: String(req.params.plotId),
+        nodeId: String(req.params.nodeId),
+        sensorId: String(req.params.sensorId),
+        sensorName: existing?.name || nextSensor?.name || "",
+        value: oldValue,
+        timestamp: oldTimestamp || nowIso(),
+        status: toTrimmed(existing?.status || "OK") || "OK",
+        createdAt: nowIso(),
+      });
+
+      const readingId = makeId("reading");
+      await firestore.collection(COLLECTIONS.sensorReadings).doc(readingId).set(historyReading);
+    }
+
+    if (hasIncomingLatestValue && req.body?.latestTimestamp === undefined) {
+      nextSensor.latestTimestamp = nowIso();
+    }
+
+    if (incomingLatestTimestamp !== undefined) {
+      nextSensor.latestTimestamp = incomingLatestTimestamp;
+    }
+
+    sensors[sensorIndex] = nextSensor;
+    node.sensors = sensors;
+    nodes[nodeIndex] = node;
+
+    await firestore.collection(COLLECTIONS.plots).doc(req.params.plotId).set(
+      {
+        nodes,
+        updatedAt: nowIso(),
+      },
+      { merge: true }
+    );
+
+    res.json({ item: nextSensor });
+  } catch (e) {
+    next(e);
+  }
+});
+
+api.delete("/plots/:plotId/nodes/:nodeId/sensors/:sensorId", async (req, res, next) => {
+  try {
+    const plotId = String(req.params.plotId);
+    const nodeId = String(req.params.nodeId);
+    const sensorId = String(req.params.sensorId);
+    const plot = await getDocById(COLLECTIONS.plots, plotId);
+    if (!plot) return res.status(404).json({ message: "plot not found" });
+
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const nodes = Array.isArray(plot.nodes) ? [...plot.nodes] : [];
+    const nodeIndex = nodes.findIndex((n) => String(n?._id) === nodeId);
+    if (nodeIndex < 0) return res.status(404).json({ message: "node not found" });
+
+    const node = { ...(nodes[nodeIndex] || {}) };
+    const sensors = Array.isArray(node.sensors) ? node.sensors : [];
+    const found = sensors.find((s) => String(s?._id) === sensorId);
+    if (!found) return res.status(404).json({ message: "sensor not found" });
+
+    node.sensors = sensors.filter((s) => String(s?._id) !== sensorId);
+    nodes[nodeIndex] = node;
+
+    await firestore.collection(COLLECTIONS.plots).doc(plotId).set(
+      {
+        nodes,
+        updatedAt: nowIso(),
+      },
+      { merge: true }
+    );
+
+    const readingsSnap = await firestore
+      .collection(COLLECTIONS.sensorReadings)
+      .where("plotId", "==", plotId)
+      .where("nodeId", "==", nodeId)
+      .where("sensorId", "==", sensorId)
+      .get();
+
+    const batch = firestore.batch();
+    readingsSnap.docs.forEach((doc) => batch.delete(doc.ref));
+    await batch.commit();
+
+    res.json({ ok: true, deletedId: sensorId });
+  } catch (e) {
+    next(e);
+  }
+});
+
+api.patch("/plots/:plotId", async (req, res, next) => {
+  try {
+    const plot = await getDocById(COLLECTIONS.plots, req.params.plotId);
+    if (!plot) {
+      return res.status(404).json({ message: "plot not found" });
+    }
+
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const nextData = normalizePlotPatch(plot, req.body || {});
+    nextData.ownerRef = plot.ownerRef;
+
+    if (!nextData.plotName) {
+      return res.status(400).json({ message: "plotName is required" });
+    }
+
+    if (nextData.caretaker) {
+      const caretaker = await getDocById(COLLECTIONS.users, nextData.caretaker);
+      if (!caretaker) {
+        return res.status(400).json({ message: "caretaker user not found" });
+      }
+    }
+
+    await firestore
+      .collection(COLLECTIONS.plots)
+      .doc(req.params.plotId)
+      .set(nextData, { merge: false });
+
+    res.json({ item: withId(req.params.plotId, nextData) });
+  } catch (e) {
+    next(e);
+  }
+});
+
+api.delete("/plots/:plotId", async (req, res, next) => {
+  try {
+    const plotId = String(req.params.plotId);
+    const plot = await getDocById(COLLECTIONS.plots, plotId);
+    if (!plot) return res.status(404).json({ message: "plot not found" });
+
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    await firestore.collection(COLLECTIONS.plots).doc(plotId).delete();
+
+    const mgmtSnap = await firestore
+      .collection(COLLECTIONS.managementPlants)
+      .where("plot", "==", plotId)
+      .get();
+
+    const readingsSnap = await firestore
+      .collection(COLLECTIONS.sensorReadings)
+      .where("plotId", "==", plotId)
+      .get();
+
+    const batch = firestore.batch();
+    mgmtSnap.docs.forEach((doc) => batch.delete(doc.ref));
+    readingsSnap.docs.forEach((doc) => batch.delete(doc.ref));
+    await batch.commit();
+
+    res.json({ ok: true, deletedId: plotId });
+  } catch (e) {
+    next(e);
+  }
+});
+
+api.put("/plots/:plotId/polygon", async (req, res, next) => {
+  try {
+    const plot = await getDocById(COLLECTIONS.plots, req.params.plotId);
+    if (!plot) return res.status(404).json({ message: "plot not found" });
+
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const polygon = normalizePolygonPayload(req.body || {});
+    if (polygon.length < 3) {
+      return res.status(400).json({ message: "polygon must have at least 3 points" });
+    }
+
+    await firestore.collection(COLLECTIONS.plots).doc(req.params.plotId).set(
+      {
+        polygon,
+        updatedAt: nowIso(),
+      },
+      { merge: true }
+    );
+
+    res.json({
+      ok: true,
+      item: {
+        plotId: req.params.plotId,
+        coords: polygon,
+      },
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+api.get("/plots/:plotId/polygon", async (req, res, next) => {
+  try {
+    const plot = await getDocById(COLLECTIONS.plots, req.params.plotId);
+    if (!plot) return res.status(404).json({ message: "plot not found" });
+
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const polygon = normalizePolygon(plot.polygon || []);
+
+    res.json({
+      item: {
+        plotId: req.params.plotId,
+        coords: polygon,
+      },
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+api.delete("/plots/:plotId/polygon", async (req, res, next) => {
+  try {
+    const plot = await getDocById(COLLECTIONS.plots, req.params.plotId);
+    if (!plot) return res.status(404).json({ message: "plot not found" });
+
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    await firestore.collection(COLLECTIONS.plots).doc(req.params.plotId).set(
+      {
+        polygon: [],
+        updatedAt: nowIso(),
+      },
+      { merge: true }
+    );
+
+    res.json({
+      ok: true,
+      item: {
+        plotId: req.params.plotId,
+        coords: [],
+      },
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+api.post("/plots/:plotId/nodes", async (req, res, next) => {
+  try {
+    const plot = await getDocById(COLLECTIONS.plots, req.params.plotId);
+    if (!plot) return res.status(404).json({ message: "plot not found" });
+
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const node = normalizeNode(req.body || {});
+    if (!node.nodeName) return res.status(400).json({ message: "nodeName is required" });
+    if (!node.uid) return res.status(400).json({ message: "uid is required" });
+    if (node.lat === null || node.lng === null) {
+      return res.status(400).json({ message: "lat and lng are required" });
+    }
+
+    const nodes = Array.isArray(plot.nodes) ? plot.nodes : [];
+    const dupUid = nodes.find((n) => String(n?.uid) === String(node.uid));
+    if (dupUid) return res.status(409).json({ message: "node uid already exists in this plot" });
+
+    const nextNodes = [...nodes, node];
+    await firestore.collection(COLLECTIONS.plots).doc(req.params.plotId).set(
+      {
+        nodes: nextNodes,
+        updatedAt: nowIso(),
+      },
+      { merge: true }
+    );
+
+    res.status(201).json({ item: node });
+  } catch (e) {
+    next(e);
+  }
+});
+
+api.patch("/plots/:plotId/nodes/:nodeId", async (req, res, next) => {
+  try {
+    const plot = await getDocById(COLLECTIONS.plots, req.params.plotId);
+    if (!plot) return res.status(404).json({ message: "plot not found" });
+
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const nodes = Array.isArray(plot.nodes) ? [...plot.nodes] : [];
+    const index = nodes.findIndex((n) => String(n?._id) === String(req.params.nodeId));
+    if (index < 0) return res.status(404).json({ message: "node not found" });
+
+    const existing = nodes[index];
+    const next = normalizeNode(
+      { ...existing, ...req.body, sensors: req.body?.sensors ?? existing.sensors },
+      existing
+    );
+
+    if (!next.nodeName) return res.status(400).json({ message: "nodeName is required" });
+    if (!next.uid) return res.status(400).json({ message: "uid is required" });
+    if (next.lat === null || next.lng === null) {
+      return res.status(400).json({ message: "lat and lng are required" });
+    }
+
+    const dupUid = nodes.find((n, i) => i !== index && String(n?.uid) === String(next.uid));
+    if (dupUid) return res.status(409).json({ message: "node uid already exists in this plot" });
+
+    nodes[index] = next;
+    await firestore.collection(COLLECTIONS.plots).doc(req.params.plotId).set(
+      {
+        nodes,
+        updatedAt: nowIso(),
+      },
+      { merge: true }
+    );
+
+    res.json({ item: next });
+  } catch (e) {
+    next(e);
+  }
+});
+
+api.delete("/plots/:plotId/nodes/:nodeId", async (req, res, next) => {
+  try {
+    const plotId = String(req.params.plotId);
+    const nodeId = String(req.params.nodeId);
+    const plot = await getDocById(COLLECTIONS.plots, plotId);
+    if (!plot) return res.status(404).json({ message: "plot not found" });
+
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const nodes = Array.isArray(plot.nodes) ? plot.nodes : [];
+    const found = nodes.find((n) => String(n?._id) === nodeId);
+    if (!found) return res.status(404).json({ message: "node not found" });
+
+    const nextNodes = nodes.filter((n) => String(n?._id) !== nodeId);
+    await firestore.collection(COLLECTIONS.plots).doc(plotId).set(
+      {
+        nodes: nextNodes,
+        updatedAt: nowIso(),
+      },
+      { merge: true }
+    );
+
+    const readingsSnap = await firestore
+      .collection(COLLECTIONS.sensorReadings)
+      .where("plotId", "==", plotId)
+      .where("nodeId", "==", nodeId)
+      .get();
+
+    const batch = firestore.batch();
+    readingsSnap.docs.forEach((doc) => batch.delete(doc.ref));
+    await batch.commit();
+
+    res.json({ ok: true, deletedId: nodeId });
+  } catch (e) {
+    next(e);
+  }
+});
+
+api.post("/plots/:plotId/nodes/:nodeId/sensors", async (req, res, next) => {
+  try {
+    const plot = await getDocById(COLLECTIONS.plots, req.params.plotId);
+    if (!plot) return res.status(404).json({ message: "plot not found" });
+
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const nodes = Array.isArray(plot.nodes) ? [...plot.nodes] : [];
+    const nodeIndex = nodes.findIndex((n) => String(n?._id) === String(req.params.nodeId));
+    if (nodeIndex < 0) return res.status(404).json({ message: "node not found" });
+
+    const node = { ...(nodes[nodeIndex] || {}) };
+    const sensors = Array.isArray(node.sensors) ? [...node.sensors] : [];
+    const sensor = normalizeSensor(req.body || {});
+
+    if (!sensor.name) return res.status(400).json({ message: "sensor name is required" });
+    if (!sensor.uid) return res.status(400).json({ message: "sensor uid is required" });
+
+    const dupUid = sensors.find((s) => String(s?.uid) === String(sensor.uid));
+    if (dupUid) return res.status(409).json({ message: "sensor uid already exists in this node" });
+
+    sensors.push(sensor);
+    node.sensors = sensors;
+    nodes[nodeIndex] = node;
+
+    await firestore.collection(COLLECTIONS.plots).doc(req.params.plotId).set(
+      {
+        nodes,
+        updatedAt: nowIso(),
+      },
+      { merge: true }
+    );
+
+    res.status(201).json({ item: sensor });
+  } catch (e) {
+    next(e);
+  }
+});
+
+api.patch("/plots/:plotId/nodes/:nodeId/sensors/:sensorId", async (req, res, next) => {
+  try {
+    const plot = await getDocById(COLLECTIONS.plots, req.params.plotId);
+    if (!plot) return res.status(404).json({ message: "plot not found" });
+
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const nodes = Array.isArray(plot.nodes) ? [...plot.nodes] : [];
+    const nodeIndex = nodes.findIndex((n) => String(n?._id) === String(req.params.nodeId));
+    if (nodeIndex < 0) return res.status(404).json({ message: "node not found" });
+
+    const node = { ...(nodes[nodeIndex] || {}) };
+    const sensors = Array.isArray(node.sensors) ? [...node.sensors] : [];
+    const sensorIndex = sensors.findIndex((s) => String(s?._id) === String(req.params.sensorId));
+    if (sensorIndex < 0) return res.status(404).json({ message: "sensor not found" });
+
+    const existing = sensors[sensorIndex];
+    const nextSensor = normalizeSensor({ ...existing, ...req.body }, existing);
+
+    if (!nextSensor.name) return res.status(400).json({ message: "sensor name is required" });
+    if (!nextSensor.uid) return res.status(400).json({ message: "sensor uid is required" });
+
+    const dupUid = sensors.find((s, i) => i !== sensorIndex && String(s?.uid) === String(nextSensor.uid));
+    if (dupUid) {
+      return res.status(409).json({ message: "sensor uid already exists in this node" });
+    }
+
+    const hasIncomingLatestValue = req.body?.latestValue !== undefined;
+    const incomingLatestValue = hasIncomingLatestValue
+      ? toNumberOrNull(req.body.latestValue)
+      : undefined;
+
+    if (hasIncomingLatestValue && incomingLatestValue === null) {
+      return res.status(400).json({ message: "latestValue must be a number" });
+    }
+
+    const incomingLatestTimestamp =
+      req.body?.latestTimestamp !== undefined
+        ? (req.body.latestTimestamp && isIsoDateLike(req.body.latestTimestamp)
+          ? req.body.latestTimestamp
+          : nowIso())
+        : undefined;
+
+    const oldValue = toNumberOrNull(existing?.latestValue);
+    const oldTimestamp =
+      existing?.latestTimestamp && isIsoDateLike(existing.latestTimestamp)
+        ? existing.latestTimestamp
+        : null;
+
+    if (hasIncomingLatestValue && oldValue !== null) {
+      const historyReading = cleanUndefined({
+        plotId: String(req.params.plotId),
+        nodeId: String(req.params.nodeId),
+        sensorId: String(req.params.sensorId),
+        sensorName: existing?.name || nextSensor?.name || "",
+        value: oldValue,
+        timestamp: oldTimestamp || nowIso(),
+        status: toTrimmed(existing?.status || "OK") || "OK",
+        createdAt: nowIso(),
+      });
+
+      const readingId = makeId("reading");
+      await firestore.collection(COLLECTIONS.sensorReadings).doc(readingId).set(historyReading);
+    }
+
+    if (hasIncomingLatestValue && req.body?.latestTimestamp === undefined) {
+      nextSensor.latestTimestamp = nowIso();
+    }
+
+    if (incomingLatestTimestamp !== undefined) {
+      nextSensor.latestTimestamp = incomingLatestTimestamp;
+    }
+
+    sensors[sensorIndex] = nextSensor;
+    node.sensors = sensors;
+    nodes[nodeIndex] = node;
+
+    await firestore.collection(COLLECTIONS.plots).doc(req.params.plotId).set(
+      {
+        nodes,
+        updatedAt: nowIso(),
+      },
+      { merge: true }
+    );
+
+    res.json({ item: nextSensor });
+  } catch (e) {
+    next(e);
+  }
+});
+
+api.delete("/plots/:plotId/nodes/:nodeId/sensors/:sensorId", async (req, res, next) => {
+  try {
+    const plotId = String(req.params.plotId);
+    const nodeId = String(req.params.nodeId);
+    const sensorId = String(req.params.sensorId);
+    const plot = await getDocById(COLLECTIONS.plots, plotId);
+    if (!plot) return res.status(404).json({ message: "plot not found" });
+
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const nodes = Array.isArray(plot.nodes) ? [...plot.nodes] : [];
+    const nodeIndex = nodes.findIndex((n) => String(n?._id) === nodeId);
+    if (nodeIndex < 0) return res.status(404).json({ message: "node not found" });
+
+    const node = { ...(nodes[nodeIndex] || {}) };
+    const sensors = Array.isArray(node.sensors) ? node.sensors : [];
+    const found = sensors.find((s) => String(s?._id) === sensorId);
+    if (!found) return res.status(404).json({ message: "sensor not found" });
+
+    node.sensors = sensors.filter((s) => String(s?._id) !== sensorId);
+    nodes[nodeIndex] = node;
+
+    await firestore.collection(COLLECTIONS.plots).doc(plotId).set(
+      {
+        nodes,
+        updatedAt: nowIso(),
+      },
+      { merge: true }
+    );
+
+    const readingsSnap = await firestore
+      .collection(COLLECTIONS.sensorReadings)
+      .where("plotId", "==", plotId)
+      .where("nodeId", "==", nodeId)
+      .where("sensorId", "==", sensorId)
+      .get();
+
+    const batch = firestore.batch();
+    readingsSnap.docs.forEach((doc) => batch.delete(doc.ref));
+    await batch.commit();
+
+    res.json({ ok: true, deletedId: sensorId });
   } catch (e) {
     next(e);
   }
@@ -1474,11 +2589,26 @@ api.delete("/plots/:plotId/nodes/:nodeId/sensors/:sensorId", async (req, res, ne
 
 api.get("/management-plants", async (req, res, next) => {
   try {
+    const scopeOwnerRef = getOwnerScope(req.user);
+    if (!scopeOwnerRef) {
+      return res.json({ items: [] });
+    }
+
     let ref = firestore.collection(COLLECTIONS.managementPlants);
     const plotId = toTrimmed(req.query.plot);
     if (plotId) ref = ref.where("plot", "==", plotId);
+
     const snap = await ref.orderBy("createdAt", "desc").get();
-    const items = snap.docs.map((doc) => withId(doc.id, doc.data() || {}));
+
+    const items = [];
+    for (const doc of snap.docs) {
+      const item = withId(doc.id, doc.data() || {});
+      const plot = await getDocById(COLLECTIONS.plots, item.plot);
+      if (plot && canAccessOwnedDoc(req.user, plot.ownerRef)) {
+        items.push(item);
+      }
+    }
+
     res.json({ items });
   } catch (e) {
     next(e);
@@ -1493,8 +2623,13 @@ api.post("/management-plants", async (req, res, next) => {
     if (!data.startDate || !isIsoDateLike(data.startDate)) {
       return res.status(400).json({ message: "startDate is required" });
     }
+
     const plot = await getDocById(COLLECTIONS.plots, data.plot);
     if (!plot) return res.status(400).json({ message: "plot not found" });
+
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
 
     const id = makeId("mgmt");
     await firestore.collection(COLLECTIONS.managementPlants).doc(id).set(data);
@@ -1509,6 +2644,11 @@ api.patch("/management-plants/:managementId", async (req, res, next) => {
     const existing = await getDocById(COLLECTIONS.managementPlants, req.params.managementId);
     if (!existing) return res.status(404).json({ message: "management plant not found" });
 
+    const currentPlot = await getDocById(COLLECTIONS.plots, existing.plot);
+    if (!currentPlot || !canAccessOwnedDoc(req.user, currentPlot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
     const nextData = normalizeManagementPlantPatch(existing, req.body || {});
     if (!nextData.plot) return res.status(400).json({ message: "plot is required" });
     if (!nextData.species) return res.status(400).json({ message: "species is required" });
@@ -1516,7 +2656,15 @@ api.patch("/management-plants/:managementId", async (req, res, next) => {
     const plot = await getDocById(COLLECTIONS.plots, nextData.plot);
     if (!plot) return res.status(400).json({ message: "plot not found" });
 
-    await firestore.collection(COLLECTIONS.managementPlants).doc(req.params.managementId).set(nextData, { merge: false });
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    await firestore
+      .collection(COLLECTIONS.managementPlants)
+      .doc(req.params.managementId)
+      .set(nextData, { merge: false });
+
     res.json({ item: withId(req.params.managementId, nextData) });
   } catch (e) {
     next(e);
@@ -1527,12 +2675,153 @@ api.delete("/management-plants/:managementId", async (req, res, next) => {
   try {
     const existing = await getDocById(COLLECTIONS.managementPlants, req.params.managementId);
     if (!existing) return res.status(404).json({ message: "management plant not found" });
+
+    const plot = await getDocById(COLLECTIONS.plots, existing.plot);
+    if (!plot || !canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
     await firestore.collection(COLLECTIONS.managementPlants).doc(req.params.managementId).delete();
     res.json({ ok: true, deletedId: req.params.managementId });
   } catch (e) {
     next(e);
   }
 });
+
+api.get("/management-plants", async (req, res, next) => {
+  try {
+    const scopeOwnerRef = getOwnerScope(req.user);
+    if (!scopeOwnerRef) {
+      return res.json({ items: [] });
+    }
+
+    let ref = firestore.collection(COLLECTIONS.managementPlants);
+    const plotId = toTrimmed(req.query.plot);
+    if (plotId) ref = ref.where("plot", "==", plotId);
+
+    const snap = await ref.orderBy("createdAt", "desc").get();
+
+    const items = [];
+    for (const doc of snap.docs) {
+      const item = withId(doc.id, doc.data() || {});
+      const plot = await getDocById(COLLECTIONS.plots, item.plot);
+      if (plot && canAccessOwnedDoc(req.user, plot.ownerRef)) {
+        items.push(item);
+      }
+    }
+
+    res.json({ items });
+  } catch (e) {
+    next(e);
+  }
+});
+
+api.post("/management-plants", async (req, res, next) => {
+  try {
+    const data = normalizeManagementPlantCreate(req.body || {});
+    if (!data.plot) return res.status(400).json({ message: "plot is required" });
+    if (!data.species) return res.status(400).json({ message: "species is required" });
+    if (!data.startDate || !isIsoDateLike(data.startDate)) {
+      return res.status(400).json({ message: "startDate is required" });
+    }
+
+    const plot = await getDocById(COLLECTIONS.plots, data.plot);
+    if (!plot) return res.status(400).json({ message: "plot not found" });
+
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const id = makeId("mgmt");
+    await firestore.collection(COLLECTIONS.managementPlants).doc(id).set(data);
+    res.status(201).json({ item: withId(id, data) });
+  } catch (e) {
+    next(e);
+  }
+});
+
+api.patch("/management-plants/:managementId", async (req, res, next) => {
+  try {
+    const existing = await getDocById(COLLECTIONS.managementPlants, req.params.managementId);
+    if (!existing) return res.status(404).json({ message: "management plant not found" });
+
+    const currentPlot = await getDocById(COLLECTIONS.plots, existing.plot);
+    if (!currentPlot || !canAccessOwnedDoc(req.user, currentPlot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const nextData = normalizeManagementPlantPatch(existing, req.body || {});
+    if (!nextData.plot) return res.status(400).json({ message: "plot is required" });
+    if (!nextData.species) return res.status(400).json({ message: "species is required" });
+
+    const plot = await getDocById(COLLECTIONS.plots, nextData.plot);
+    if (!plot) return res.status(400).json({ message: "plot not found" });
+
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    await firestore
+      .collection(COLLECTIONS.managementPlants)
+      .doc(req.params.managementId)
+      .set(nextData, { merge: false });
+
+    res.json({ item: withId(req.params.managementId, nextData) });
+  } catch (e) {
+    next(e);
+  }
+});
+
+api.delete("/management-plants/:managementId", async (req, res, next) => {
+  try {
+    const existing = await getDocById(COLLECTIONS.managementPlants, req.params.managementId);
+    if (!existing) return res.status(404).json({ message: "management plant not found" });
+
+    const plot = await getDocById(COLLECTIONS.plots, existing.plot);
+    if (!plot || !canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    await firestore.collection(COLLECTIONS.managementPlants).doc(req.params.managementId).delete();
+    res.json({ ok: true, deletedId: req.params.managementId });
+  } catch (e) {
+    next(e);
+  }
+});
+function readingTimestampMs(item) {
+  const raw = item?.timestamp || item?.ts || item?.time || item?.createdAt || item?.updatedAt;
+  const ms = new Date(raw).getTime();
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function filterReadingItems(items, { sensorId = "", plotId = "", nodeId = "" } = {}) {
+  return (Array.isArray(items) ? items : []).filter((item) => {
+    if (sensorId && String(item?.sensorId || "").trim() !== String(sensorId).trim()) return false;
+    if (plotId && String(item?.plotId || "").trim() !== String(plotId).trim()) return false;
+    if (nodeId && String(item?.nodeId || "").trim() !== String(nodeId).trim()) return false;
+    return true;
+  });
+}
+
+async function fetchSensorReadingsNoIndexFallback({ sensorId = "", plotId = "", nodeId = "", limit = 2000 } = {}) {
+  const hardLimit = Math.max(1, Math.min(Number(limit) || 2000, 5000));
+  const collectionRef = firestore.collection(COLLECTIONS.sensorReadings);
+
+  const queryPlan = sensorId
+    ? collectionRef.where("sensorId", "==", sensorId)
+    : nodeId
+      ? collectionRef.where("nodeId", "==", nodeId)
+      : plotId
+        ? collectionRef.where("plotId", "==", plotId)
+        : collectionRef;
+
+  const snap = await queryPlan.limit(Math.max(hardLimit * 5, 500)).get();
+  const rawItems = snap.docs.map((doc) => withId(doc.id, doc.data() || {}));
+
+  return filterReadingItems(rawItems, { sensorId, plotId, nodeId })
+    .sort((a, b) => readingTimestampMs(b) - readingTimestampMs(a))
+    .slice(0, hardLimit);
+}
 
 api.get("/sensor-readings", async (req, res, next) => {
   try {
@@ -1541,18 +2830,35 @@ api.get("/sensor-readings", async (req, res, next) => {
     const nodeId = toTrimmed(req.query.nodeId);
     const limit = Math.max(1, Math.min(Number(req.query.limit || 2000), 5000));
 
-    const items = await fetchSensorReadingsNoIndexFallback({
+    if (plotId) {
+      const plot = await getDocById(COLLECTIONS.plots, plotId);
+      if (!plot || !canAccessOwnedDoc(req.user, plot.ownerRef)) {
+        return res.json({ items: [] });
+      }
+    }
+
+    const rawItems = await fetchSensorReadingsNoIndexFallback({
       sensorId,
       plotId,
       nodeId,
       limit,
     });
 
+    const items = [];
+    for (const item of rawItems) {
+      if (!item?.plotId) continue;
+      const plot = await getDocById(COLLECTIONS.plots, item.plotId);
+      if (plot && canAccessOwnedDoc(req.user, plot.ownerRef)) {
+        items.push(item);
+      }
+    }
+
     res.json({ items });
   } catch (e) {
     next(e);
   }
 });
+
 function readingTimestampMs(item) {
   const raw = item?.timestamp || item?.ts || item?.time || item?.createdAt || item?.updatedAt;
   const ms = new Date(raw).getTime();
@@ -1600,11 +2906,19 @@ api.post("/sensor-readings", async (req, res, next) => {
     const value = toNumberOrNull(req.body?.value);
     if (value === null) return res.status(400).json({ message: "value is required" });
 
-    const timestamp = req.body?.timestamp && isIsoDateLike(req.body.timestamp) ? req.body.timestamp : nowIso();
     const found = await findPlotContainingSensor(plotId, nodeId, sensorId);
     if (!found) {
       return res.status(400).json({ message: "sensor not found in plot/node" });
     }
+
+    if (!canAccessOwnedDoc(req.user, found.plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const timestamp =
+      req.body?.timestamp && isIsoDateLike(req.body.timestamp)
+        ? req.body.timestamp
+        : nowIso();
 
     const sensor = found.plot.nodes[found.nodeIndex].sensors[found.sensorIndex];
     const reading = cleanUndefined({
@@ -1620,6 +2934,7 @@ api.post("/sensor-readings", async (req, res, next) => {
 
     const id = makeId("reading");
     await firestore.collection(COLLECTIONS.sensorReadings).doc(id).set(reading);
+
     await syncLatestSensorState({
       plotId,
       nodeId,
@@ -1640,8 +2955,20 @@ api.get("/sensor-readings/latest", async (req, res, next) => {
     const sensorId = requireStringField(res, req.query.sensorId, "sensorId");
     if (!sensorId) return;
 
-    const items = await fetchSensorReadingsNoIndexFallback({ sensorId, limit: 1 });
-    if (!items.length) return res.status(404).json({ message: "No readings found" });
+    const rawItems = await fetchSensorReadingsNoIndexFallback({ sensorId, limit: 20 });
+
+    const items = [];
+    for (const item of rawItems) {
+      if (!item?.plotId) continue;
+      const plot = await getDocById(COLLECTIONS.plots, item.plotId);
+      if (plot && canAccessOwnedDoc(req.user, plot.ownerRef)) {
+        items.push(item);
+      }
+    }
+
+    if (!items.length) {
+      return res.status(404).json({ message: "No readings found" });
+    }
 
     res.json({ item: items[0] });
   } catch (e) {
