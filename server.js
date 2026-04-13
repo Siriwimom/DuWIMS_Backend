@@ -26,6 +26,7 @@ const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "7d";
 const COLLECTIONS = {
   users: "users",
   plots: "plots",
+  nodes: "node",
   managementPlants: "managementPlants",
   sensorReadings: "sensorReadings",
   passwordOtps: "passwordOtps",
@@ -430,6 +431,86 @@ function normalizeNode(input, existing = null) {
     sensors: sensorsInput.map((sensor) => normalizeSensor(sensor)),
   });
 }
+function sanitizeNodeDoc(node) {
+  if (!node) return null;
+
+  return cleanUndefined({
+    _id: toTrimmed(node._id || node.id) || "",
+    uid: toTrimmed(node.uid || ""),
+    nodeName: toTrimmed(node.nodeName || ""),
+    status: toTrimmed(node.status || "ACTIVE") || "ACTIVE",
+    lat:
+      node.lat === undefined ? null : toNumberOrNull(node.lat),
+    lng:
+      node.lng === undefined ? null : toNumberOrNull(node.lng),
+    plotId:
+      node.plotId === undefined || node.plotId === null || node.plotId === ""
+        ? null
+        : toTrimmed(node.plotId),
+    ownerRef: toTrimmed(node.ownerRef || ""),
+    sensors: Array.isArray(node.sensors)
+      ? node.sensors.map((s) => normalizeSensor(s))
+      : [],
+    createdAt: node.createdAt || nowIso(),
+    updatedAt: nowIso(),
+  });
+}
+
+async function getNodeByUidForOwner(uid, ownerRef) {
+  const safeUid = toTrimmed(uid);
+  if (!safeUid) return null;
+
+  if (ownerRef) {
+    const scopedSnap = await firestore
+      .collection(COLLECTIONS.nodes)
+      .where("uid", "==", safeUid)
+      .where("ownerRef", "==", ownerRef)
+      .limit(1)
+      .get();
+
+    if (!scopedSnap.empty) {
+      const doc = scopedSnap.docs[0];
+      return withId(doc.id, doc.data() || {});
+    }
+  }
+
+  // fallback สำหรับ node เก่าที่ยังไม่มี ownerRef
+  const fallbackSnap = await firestore
+    .collection(COLLECTIONS.nodes)
+    .where("uid", "==", safeUid)
+    .limit(1)
+    .get();
+
+  if (fallbackSnap.empty) return null;
+  const doc = fallbackSnap.docs[0];
+  return withId(doc.id, doc.data() || {});
+}
+
+async function getNodeByIdForOwner(nodeId, ownerRef) {
+  const node = await getDocById(COLLECTIONS.nodes, nodeId);
+  if (!node) return null;
+  if (String(node.ownerRef || "") !== String(ownerRef || "")) return null;
+  return node;
+}
+
+async function getNodesByPlotId(plotId, ownerRef) {
+  const snap = await firestore
+    .collection(COLLECTIONS.nodes)
+    .where("plotId", "==", String(plotId))
+    .where("ownerRef", "==", String(ownerRef))
+    .get();
+
+  return snap.docs.map((doc) => sanitizeNodeDoc(withId(doc.id, doc.data() || {})));
+}
+
+async function attachNodesToPlot(plot) {
+  if (!plot) return null;
+  const nodes = await getNodesByPlotId(plot.id, plot.ownerRef);
+  return {
+    ...plot,
+    nodes,
+  };
+}
 
 function normalizePlotCreate(body) {
   const caretaker = toTrimmed(body.caretaker);
@@ -563,7 +644,7 @@ app.get("/__version", (req, res) => {
   res.json({ build: BUILD_TAG, file: __filename, cwd: process.cwd() });
 });
 
-app.get("/health", (req, res) => res.json({ ok: true, build: BUILD_TAG, message: "9/4/2025 - Server is healthy" }));
+app.get("/health", (req, res) => res.json({ ok: true, build: BUILD_TAG, message: "14/4/2026 - Server is healthy12" }));
 
 app.get("/firestore/ping", async (req, res) => {
   try {
@@ -1150,7 +1231,46 @@ app.post("/auth/link-owner", auth, async (req, res) => {
 });
 
 api.use(auth);
+api.get("/nodes", async (req, res, next) => {
+  try {
+    const ownerRef = getOwnerScope(req.user);
+    if (!ownerRef) {
+      return res.json({ items: [] });
+    }
 
+    const snap = await firestore
+      .collection(COLLECTIONS.nodes)
+      .where("ownerRef", "==", ownerRef)
+      .get();
+
+    const items = snap.docs.map((doc) =>
+      sanitizeNodeDoc(withId(doc.id, doc.data() || {}))
+    );
+
+    res.json({ items });
+  } catch (e) {
+    next(e);
+  }
+});
+api.get("/nodes/by-uid/:uid", async (req, res, next) => {
+  try {
+    const ownerRef = getOwnerScope(req.user);
+    const uid = toTrimmed(req.params.uid);
+
+    if (!uid) {
+      return res.status(400).json({ message: "uid is required" });
+    }
+
+    const node = await getNodeByUidForOwner(uid, ownerRef);
+    if (!node) {
+      return res.status(404).json({ message: "node uid not found" });
+    }
+
+    res.json({ item: sanitizeNodeDoc(node) });
+  } catch (e) {
+    next(e);
+  }
+});
 api.get("/users", async (req, res, next) => {
   try {
     const scopeOwnerRef = getOwnerScope(req.user);
@@ -1202,7 +1322,9 @@ api.get("/plots", async (req, res, next) => {
       .where("ownerRef", "==", ownerRef)
       .get();
 
-    const items = snap.docs.map((doc) => withId(doc.id, doc.data() || {}));
+    const basePlots = snap.docs.map((doc) => withId(doc.id, doc.data() || {}));
+    const items = await Promise.all(basePlots.map((plot) => attachNodesToPlot(plot)));
+
     res.json({ items });
   } catch (e) {
     next(e);
@@ -1241,13 +1363,14 @@ api.post("/plots", async (req, res, next) => {
 
 api.get("/plots/:plotId", async (req, res, next) => {
   try {
-    const item = await getDocById(COLLECTIONS.plots, req.params.plotId);
-    if (!item) return res.status(404).json({ message: "plot not found" });
+    const plot = await getDocById(COLLECTIONS.plots, req.params.plotId);
+    if (!plot) return res.status(404).json({ message: "plot not found" });
 
-    if (!canAccessOwnedDoc(req.user, item.ownerRef)) {
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
       return res.status(403).json({ message: "Forbidden" });
     }
 
+    const item = await attachNodesToPlot(plot);
     res.json({ item });
   } catch (e) {
     next(e);
@@ -1410,6 +1533,11 @@ api.delete("/plots/:plotId/polygon", async (req, res, next) => {
 
 api.post("/plots/:plotId/nodes", async (req, res, next) => {
   try {
+    const ownerRef = getOwnerScope(req.user);
+    if (!ownerRef) {
+      return res.status(400).json({ message: "No owner scope" });
+    }
+
     const plot = await getDocById(COLLECTIONS.plots, req.params.plotId);
     if (!plot) return res.status(404).json({ message: "plot not found" });
 
@@ -1417,27 +1545,192 @@ api.post("/plots/:plotId/nodes", async (req, res, next) => {
       return res.status(403).json({ message: "Forbidden" });
     }
 
-    const node = normalizeNode(req.body || {});
-    if (!node.nodeName) return res.status(400).json({ message: "nodeName is required" });
-    if (!node.uid) return res.status(400).json({ message: "uid is required" });
-    if (node.lat === null || node.lng === null) {
+    const uid = requireStringField(res, req.body?.uid, "uid");
+    if (!uid) return;
+
+    const existingNode = await getNodeByUidForOwner(uid, ownerRef);
+    if (!existingNode) {
+      return res.status(404).json({ message: "node uid not found in nodes collection" });
+    }
+
+    const nextNode = sanitizeNodeDoc({
+  ...existingNode,
+  nodeName: req.body?.nodeName ?? existingNode.nodeName,
+  status: req.body?.status ?? existingNode.status,
+  lat: req.body?.lat ?? existingNode.lat,
+  lng: req.body?.lng ?? existingNode.lng,
+  sensors: req.body?.sensors ?? existingNode.sensors,
+  plotId: String(req.params.plotId),
+  ownerRef,
+  updatedAt: nowIso(),
+});
+
+    if (nextNode.lat === null || nextNode.lng === null) {
       return res.status(400).json({ message: "lat and lng are required" });
     }
 
-    const nodes = Array.isArray(plot.nodes) ? plot.nodes : [];
-    const dupUid = nodes.find((n) => String(n?.uid) === String(node.uid));
-    if (dupUid) return res.status(409).json({ message: "node uid already exists in this plot" });
+    // กัน node ซ้ำใน plot เดียวกันด้วย uid
+    const dupSnap = await firestore
+      .collection(COLLECTIONS.nodes)
+      .where("plotId", "==", String(req.params.plotId))
+      .where("ownerRef", "==", ownerRef)
+      .where("uid", "==", uid)
+      .limit(1)
+      .get();
 
-    const nextNodes = [...nodes, node];
-    await firestore.collection(COLLECTIONS.plots).doc(req.params.plotId).set(
+    if (!dupSnap.empty && dupSnap.docs[0].id !== existingNode.id) {
+      return res.status(409).json({ message: "node uid already exists in this plot" });
+    }
+
+    await firestore
+      .collection(COLLECTIONS.nodes)
+      .doc(existingNode.id)
+      .set(nextNode, { merge: true });
+
+    res.status(201).json({ item: withId(existingNode.id, nextNode) });
+  } catch (e) {
+    next(e);
+  }
+});
+api.patch("/nodes/link-by-uid", async (req, res, next) => {
+  try {
+    const ownerRef = getOwnerScope(req.user);
+    if (!ownerRef) {
+      return res.status(400).json({ message: "No owner scope" });
+    }
+
+    const uid = requireStringField(res, req.body?.uid, "uid");
+    if (!uid) return;
+
+    const plotId = requireStringField(res, req.body?.plotId, "plotId");
+    if (!plotId) return;
+
+    const plot = await getDocById(COLLECTIONS.plots, plotId);
+    if (!plot) {
+      return res.status(404).json({ message: "plot not found" });
+    }
+
+    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const node = await getNodeByUidForOwner(uid, ownerRef);
+    if (!node) {
+      return res.status(404).json({ message: "node uid not found" });
+    }
+
+    if (node.plotId && String(node.plotId) !== String(plotId)) {
+      return res.status(409).json({
+        message: "node is already linked to another plot",
+      });
+    }
+
+    const nextNode = sanitizeNodeDoc({
+  ...node,
+  nodeName: req.body?.nodeName ?? node.nodeName,
+  status: req.body?.status ?? node.status,
+  lat: req.body?.lat,
+  lng: req.body?.lng,
+  plotId,
+  ownerRef,
+  sensors: req.body?.sensors ?? node.sensors,
+  createdAt: node.createdAt || nowIso(),
+  updatedAt: nowIso(),
+});
+
+    if (nextNode.lat === null || nextNode.lng === null) {
+      return res.status(400).json({ message: "lat and lng are required" });
+    }
+
+    await firestore
+      .collection(COLLECTIONS.nodes)
+      .doc(node.id)
+      .set(nextNode, { merge: false });
+
+    res.json({ item: withId(node.id, nextNode) });
+  } catch (e) {
+    next(e);
+  }
+});
+api.patch("/nodes/:nodeId", async (req, res, next) => {
+  try {
+    const ownerRef = getOwnerScope(req.user);
+    if (!ownerRef) {
+      return res.status(400).json({ message: "No owner scope" });
+    }
+
+    const node = await getNodeByIdForOwner(req.params.nodeId, ownerRef);
+    if (!node) {
+      return res.status(404).json({ message: "node not found" });
+    }
+
+    const nextPlotId =
+      req.body?.plotId !== undefined
+        ? toTrimmed(req.body.plotId) || null
+        : node.plotId || null;
+
+    if (nextPlotId) {
+      const plot = await getDocById(COLLECTIONS.plots, nextPlotId);
+      if (!plot) {
+        return res.status(404).json({ message: "plot not found" });
+      }
+      if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
+        return res.status(403).json({ message: "Forbidden" });
+      }
+    }
+
+    const nextNode = sanitizeNodeDoc({
+      ...node,
+      ...req.body,
+      plotId: nextPlotId,
+      ownerRef,
+      createdAt: node.createdAt || nowIso(),
+      updatedAt: nowIso(),
+    });
+
+    if (!nextNode.uid) {
+      return res.status(400).json({ message: "uid is required" });
+    }
+    if (!nextNode.nodeName) {
+      return res.status(400).json({ message: "nodeName is required" });
+    }
+    if (nextNode.lat === null || nextNode.lng === null) {
+      return res.status(400).json({ message: "lat and lng are required" });
+    }
+
+    await firestore
+      .collection(COLLECTIONS.nodes)
+      .doc(node.id)
+      .set(nextNode, { merge: false });
+
+    res.json({ item: withId(node.id, nextNode) });
+  } catch (e) {
+    next(e);
+  }
+});
+api.patch("/nodes/:nodeId/unlink", async (req, res, next) => {
+  try {
+    const ownerRef = getOwnerScope(req.user);
+    if (!ownerRef) {
+      return res.status(400).json({ message: "No owner scope" });
+    }
+
+    const node = await getNodeByIdForOwner(req.params.nodeId, ownerRef);
+    if (!node) {
+      return res.status(404).json({ message: "node not found" });
+    }
+
+    await firestore.collection(COLLECTIONS.nodes).doc(node.id).set(
       {
-        nodes: nextNodes,
+        plotId: null,
+        lat: null,
+        lng: null,
         updatedAt: nowIso(),
       },
       { merge: true }
     );
 
-    res.status(201).json({ item: node });
+    res.json({ ok: true, item: { ...node, plotId: null, lat: null, lng: null } });
   } catch (e) {
     next(e);
   }
@@ -1445,6 +1738,11 @@ api.post("/plots/:plotId/nodes", async (req, res, next) => {
 
 api.patch("/plots/:plotId/nodes/:nodeId", async (req, res, next) => {
   try {
+    const ownerRef = getOwnerScope(req.user);
+    if (!ownerRef) {
+      return res.status(400).json({ message: "No owner scope" });
+    }
+
     const plot = await getDocById(COLLECTIONS.plots, req.params.plotId);
     if (!plot) return res.status(404).json({ message: "plot not found" });
 
@@ -1452,35 +1750,35 @@ api.patch("/plots/:plotId/nodes/:nodeId", async (req, res, next) => {
       return res.status(403).json({ message: "Forbidden" });
     }
 
-    const nodes = Array.isArray(plot.nodes) ? [...plot.nodes] : [];
-    const index = nodes.findIndex((n) => String(n?._id) === String(req.params.nodeId));
-    if (index < 0) return res.status(404).json({ message: "node not found" });
+    const existingNode = await getDocById(COLLECTIONS.nodes, req.params.nodeId);
+    if (!existingNode) {
+      return res.status(404).json({ message: "node not found" });
+    }
 
-    const existing = nodes[index];
-    const next = normalizeNode(
-      { ...existing, ...req.body, sensors: req.body?.sensors ?? existing.sensors },
-      existing
-    );
+    if (String(existingNode.ownerRef || "") !== String(ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
 
-    if (!next.nodeName) return res.status(400).json({ message: "nodeName is required" });
-    if (!next.uid) return res.status(400).json({ message: "uid is required" });
-    if (next.lat === null || next.lng === null) {
+    const nextNode = sanitizeNodeDoc({
+      ...existingNode,
+      ...req.body,
+      plotId: String(req.params.plotId),
+      ownerRef,
+      updatedAt: nowIso(),
+    });
+
+    if (!nextNode.nodeName) return res.status(400).json({ message: "nodeName is required" });
+    if (!nextNode.uid) return res.status(400).json({ message: "uid is required" });
+    if (nextNode.lat === null || nextNode.lng === null) {
       return res.status(400).json({ message: "lat and lng are required" });
     }
 
-    const dupUid = nodes.find((n, i) => i !== index && String(n?.uid) === String(next.uid));
-    if (dupUid) return res.status(409).json({ message: "node uid already exists in this plot" });
+    await firestore
+      .collection(COLLECTIONS.nodes)
+      .doc(req.params.nodeId)
+      .set(nextNode, { merge: true });
 
-    nodes[index] = next;
-    await firestore.collection(COLLECTIONS.plots).doc(req.params.plotId).set(
-      {
-        nodes,
-        updatedAt: nowIso(),
-      },
-      { merge: true }
-    );
-
-    res.json({ item: next });
+    res.json({ item: withId(req.params.nodeId, nextNode) });
   } catch (e) {
     next(e);
   }
@@ -1488,39 +1786,35 @@ api.patch("/plots/:plotId/nodes/:nodeId", async (req, res, next) => {
 
 api.delete("/plots/:plotId/nodes/:nodeId", async (req, res, next) => {
   try {
-    const plotId = String(req.params.plotId);
-    const nodeId = String(req.params.nodeId);
-    const plot = await getDocById(COLLECTIONS.plots, plotId);
+    const ownerRef = getOwnerScope(req.user);
+    if (!ownerRef) {
+      return res.status(400).json({ message: "No owner scope" });
+    }
+
+    const plot = await getDocById(COLLECTIONS.plots, req.params.plotId);
     if (!plot) return res.status(404).json({ message: "plot not found" });
 
     if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
       return res.status(403).json({ message: "Forbidden" });
     }
 
-    const nodes = Array.isArray(plot.nodes) ? plot.nodes : [];
-    const found = nodes.find((n) => String(n?._id) === nodeId);
-    if (!found) return res.status(404).json({ message: "node not found" });
+    const node = await getDocById(COLLECTIONS.nodes, req.params.nodeId);
+    if (!node) return res.status(404).json({ message: "node not found" });
 
-    const nextNodes = nodes.filter((n) => String(n?._id) !== nodeId);
-    await firestore.collection(COLLECTIONS.plots).doc(plotId).set(
+    if (String(node.ownerRef || "") !== String(ownerRef)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    // unlink จาก plot โดยไม่ลบ node ทิ้ง
+    await firestore.collection(COLLECTIONS.nodes).doc(req.params.nodeId).set(
       {
-        nodes: nextNodes,
+        plotId: null,
         updatedAt: nowIso(),
       },
       { merge: true }
     );
 
-    const readingsSnap = await firestore
-      .collection(COLLECTIONS.sensorReadings)
-      .where("plotId", "==", plotId)
-      .where("nodeId", "==", nodeId)
-      .get();
-
-    const batch = firestore.batch();
-    readingsSnap.docs.forEach((doc) => batch.delete(doc.ref));
-    await batch.commit();
-
-    res.json({ ok: true, deletedId: nodeId });
+    res.json({ ok: true, deletedId: req.params.nodeId });
   } catch (e) {
     next(e);
   }
