@@ -979,20 +979,15 @@ app.get("/auth/google/callback", async (req, res) => {
     let user = await getUserByEmail(email);
     if (!user) {
       let nickname = makeSafeNickname(me?.data?.name, email);
-      const exists = await getUserByNickname(nickname);
-      if (exists) {
-        nickname = `${nickname}_${Date.now().toString().slice(-6)}`.slice(0, 100);
-      }
 
       let role = "employee";
-
       if (req.query.state) {
         try {
           const parsed = JSON.parse(
             Buffer.from(String(req.query.state), "base64").toString()
           );
           role = toTrimmed(parsed?.role || "employee") || "employee";
-        } catch { }
+        } catch {}
       }
 
       user = await createUser({
@@ -1006,7 +1001,9 @@ app.get("/auth/google/callback", async (req, res) => {
     }
 
     const token = buildAuthToken(user);
-    return res.redirect(`${FRONTEND_URL}/dashboard?token=${encodeURIComponent(token)}`);
+
+    // เปลี่ยนจาก /dashboard เป็น /
+    return res.redirect(`${FRONTEND_URL}/?token=${encodeURIComponent(token)}`);
   } catch (e) {
     return res.redirect(
       `${FRONTEND_URL}/?error=${encodeURIComponent(e?.message || "Google auth failed")}`
@@ -1034,6 +1031,20 @@ app.get("/auth/me", auth, async (req, res) => {
     });
   }
 });
+async function getUserByNickname(nickname) {
+  const safe = toTrimmed(nickname);
+  if (!safe) return null;
+
+  const snap = await firestore
+    .collection(COLLECTIONS.users)
+    .where("nickname", "==", safe)
+    .limit(1)
+    .get();
+
+  if (snap.empty) return null;
+  const doc = snap.docs[0];
+  return withId(doc.id, doc.data() || {});
+}
 
 app.patch("/auth/update-profile", auth, async (req, res) => {
   try {
