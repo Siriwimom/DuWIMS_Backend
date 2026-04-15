@@ -1423,8 +1423,14 @@ api.delete("/plots/:plotId", async (req, res, next) => {
       return res.status(403).json({ message: "Forbidden" });
     }
 
-    await firestore.collection(COLLECTIONS.plots).doc(plotId).delete();
+    // หา node ที่ผูกอยู่กับ plot นี้ก่อน
+    const linkedNodesSnap = await firestore
+      .collection(COLLECTIONS.nodes)
+      .where("plotId", "==", plotId)
+      .where("ownerRef", "==", String(plot.ownerRef || ""))
+      .get();
 
+    // หา managementPlants + sensorReadings ที่เกี่ยวข้อง
     const mgmtSnap = await firestore
       .collection(COLLECTIONS.managementPlants)
       .where("plot", "==", plotId)
@@ -1436,11 +1442,37 @@ api.delete("/plots/:plotId", async (req, res, next) => {
       .get();
 
     const batch = firestore.batch();
+
+    // 1) ลบ plot
+    batch.delete(firestore.collection(COLLECTIONS.plots).doc(plotId));
+
+    // 2) unlink node ทั้งหมดที่อยู่ใน plot นี้
+    linkedNodesSnap.docs.forEach((doc) => {
+      batch.set(
+        doc.ref,
+        {
+          plotId: null,
+          lat: null,
+          lng: null,
+          updatedAt: nowIso(),
+        },
+        { merge: true }
+      );
+    });
+
+    // 3) ลบ managementPlants ของ plot นี้
     mgmtSnap.docs.forEach((doc) => batch.delete(doc.ref));
+
+    // 4) ลบ sensorReadings ของ plot นี้
     readingsSnap.docs.forEach((doc) => batch.delete(doc.ref));
+
     await batch.commit();
 
-    res.json({ ok: true, deletedId: plotId });
+    res.json({
+      ok: true,
+      deletedId: plotId,
+      unlinkedNodeCount: linkedNodesSnap.size,
+    });
   } catch (e) {
     next(e);
   }
@@ -2039,38 +2071,6 @@ api.patch("/plots/:plotId", async (req, res, next) => {
   }
 });
 
-api.delete("/plots/:plotId", async (req, res, next) => {
-  try {
-    const plotId = String(req.params.plotId);
-    const plot = await getDocById(COLLECTIONS.plots, plotId);
-    if (!plot) return res.status(404).json({ message: "plot not found" });
-
-    if (!canAccessOwnedDoc(req.user, plot.ownerRef)) {
-      return res.status(403).json({ message: "Forbidden" });
-    }
-
-    await firestore.collection(COLLECTIONS.plots).doc(plotId).delete();
-
-    const mgmtSnap = await firestore
-      .collection(COLLECTIONS.managementPlants)
-      .where("plot", "==", plotId)
-      .get();
-
-    const readingsSnap = await firestore
-      .collection(COLLECTIONS.sensorReadings)
-      .where("plotId", "==", plotId)
-      .get();
-
-    const batch = firestore.batch();
-    mgmtSnap.docs.forEach((doc) => batch.delete(doc.ref));
-    readingsSnap.docs.forEach((doc) => batch.delete(doc.ref));
-    await batch.commit();
-
-    res.json({ ok: true, deletedId: plotId });
-  } catch (e) {
-    next(e);
-  }
-});
 
 api.put("/plots/:plotId/polygon", async (req, res, next) => {
   try {
@@ -2488,33 +2488,6 @@ api.patch("/plots/:plotId", async (req, res, next) => {
   }
 });
 
-api.delete("/plots/:plotId", async (req, res, next) => {
-  try {
-    const plotId = String(req.params.plotId);
-    const plot = await getDocById(COLLECTIONS.plots, plotId);
-    if (!plot) return res.status(404).json({ message: "plot not found" });
-
-    await firestore.collection(COLLECTIONS.plots).doc(plotId).delete();
-
-    const mgmtSnap = await firestore
-      .collection(COLLECTIONS.managementPlants)
-      .where("plot", "==", plotId)
-      .get();
-    const readingsSnap = await firestore
-      .collection(COLLECTIONS.sensorReadings)
-      .where("plotId", "==", plotId)
-      .get();
-
-    const batch = firestore.batch();
-    mgmtSnap.docs.forEach((doc) => batch.delete(doc.ref));
-    readingsSnap.docs.forEach((doc) => batch.delete(doc.ref));
-    await batch.commit();
-
-    res.json({ ok: true, deletedId: plotId });
-  } catch (e) {
-    next(e);
-  }
-});
 
 api.put("/plots/:plotId/polygon", async (req, res, next) => {
   try {
