@@ -27,6 +27,7 @@ const COLLECTIONS = {
   users: "users",
   plots: "plots",
   nodes: "node",
+  history: "history",
   managementPlants: "managementPlants",
   sensorReadings: "sensorReadings",
   passwordOtps: "passwordOtps",
@@ -3251,6 +3252,151 @@ api.get("/sensor-readings/latest", async (req, res, next) => {
     res.json({ item: items[0] });
   } catch (e) {
     next(e);
+  }
+});
+function parseDmyDateTimeString(raw) {
+  const text = String(raw || "").trim();
+  const match = text.match(
+    /^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:[ ,T]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/
+  );
+  if (!match) return null;
+
+  const [, dd, mm, yyyy, hh = "0", mi = "0", ss = "0"] = match;
+  const d = new Date(
+    Number(yyyy),
+    Number(mm) - 1,
+    Number(dd),
+    Number(hh),
+    Number(mi),
+    Number(ss)
+  );
+
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function parseFlexibleDate(raw) {
+  if (!raw) return null;
+  if (raw instanceof Date) return Number.isNaN(raw.getTime()) ? null : raw;
+
+  if (typeof raw === "object") {
+    const sec = Number(raw?.seconds ?? raw?._seconds);
+    const nano = Number(raw?.nanoseconds ?? raw?._nanoseconds ?? 0);
+    if (Number.isFinite(sec)) {
+      const d = new Date(sec * 1000 + nano / 1e6);
+      return Number.isNaN(d.getTime()) ? null : d;
+    }
+    if (typeof raw?.toDate === "function") {
+      const d = raw.toDate();
+      return Number.isNaN(d?.getTime?.()) ? null : d;
+    }
+  }
+
+  const dmy = parseDmyDateTimeString(raw);
+  if (dmy) return dmy;
+
+  const d = new Date(raw);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function historyTimestampOf(item) {
+  return (
+    item?.server_timestamp ||
+    item?.serverTimestamp ||
+    item?.history_timestamp ||
+    item?.historyTimestamp ||
+    item?.timestamp ||
+    item?.createdAt ||
+    null
+  );
+}
+
+api.get("/history", auth, async (req, res) => {
+  try {
+    const ownerRef = getOwnerScope(req.user);
+
+    const uid = String(req.query.uid || req.query.nodeUid || "").trim();
+    const nodeId = String(req.query.nodeId || "").trim();
+    const plotId = String(req.query.plotId || "").trim();
+    const startDate = String(req.query.startDate || "").trim();
+    const endDate = String(req.query.endDate || "").trim();
+    const limit = Math.min(Number(req.query.limit) || 5000, 20000);
+
+    let items = [];
+
+    const snap = await firestore.collection(COLLECTIONS.history).limit(limit).get();
+    items = snap.docs.map((doc) => withId(doc.id, doc.data() || {}));
+
+    if (uid) {
+      items = items.filter((item) => String(item.uid || item.nodeUid || "").trim() === uid);
+    }
+
+    if (nodeId) {
+      items = items.filter((item) => String(item.nodeId || "").trim() === nodeId);
+    }
+
+    if (plotId) {
+      items = items.filter((item) => String(item.plotId || "").trim() === plotId);
+    }
+
+    // owner scope ผ่าน node collection
+    if (ownerRef) {
+      const nodeSnap = await firestore
+        .collection(COLLECTIONS.nodes)
+        .where("ownerRef", "==", String(ownerRef))
+        .get();
+
+      const allowedNodeUids = new Set();
+      const allowedNodeIds = new Set();
+      const allowedPlotIds = new Set();
+
+      nodeSnap.docs.forEach((doc) => {
+        const data = doc.data() || {};
+        allowedNodeIds.add(String(doc.id));
+        if (data.uid) allowedNodeUids.add(String(data.uid));
+        if (data.plotId) allowedPlotIds.add(String(data.plotId));
+      });
+
+      items = items.filter((item) => {
+        const itemUid = String(item.uid || item.nodeUid || "").trim();
+        const itemNodeId = String(item.nodeId || "").trim();
+        const itemPlotId = String(item.plotId || "").trim();
+
+        return (
+          (itemUid && allowedNodeUids.has(itemUid)) ||
+          (itemNodeId && allowedNodeIds.has(itemNodeId)) ||
+          (itemPlotId && allowedPlotIds.has(itemPlotId))
+        );
+      });
+    }
+
+    const startMs = startDate
+      ? new Date(`${startDate}T00:00:00`).getTime()
+      : null;
+    const endMs = endDate
+      ? new Date(`${endDate}T23:59:59`).getTime()
+      : null;
+
+    items = items.filter((item) => {
+      const d = parseFlexibleDate(historyTimestampOf(item));
+      const ms = d?.getTime?.();
+      if (!Number.isFinite(ms)) return false;
+      if (Number.isFinite(startMs) && ms < startMs) return false;
+      if (Number.isFinite(endMs) && ms > endMs) return false;
+      return true;
+    });
+
+    items.sort((a, b) => {
+      const ams = parseFlexibleDate(historyTimestampOf(a))?.getTime?.() || 0;
+      const bms = parseFlexibleDate(historyTimestampOf(b))?.getTime?.() || 0;
+      return ams - bms;
+    });
+
+    return res.json({ items });
+  } catch (e) {
+    return res.status(500).json({
+      message: "Load history failed",
+      error: String(e.message || e),
+    });
   }
 });
 
